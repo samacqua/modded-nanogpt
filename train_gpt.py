@@ -1094,6 +1094,171 @@ class ForwardScheduleConfig:
     ws_short: int
     ws_long: int
 
+class EmbeddingLoRA(nn.Module):
+    def __init__(self, num_embeddings: int, embedding_dim: int, rank: int):
+        super().__init__()
+        self.rank = rank
+        self.A = nn.Embedding(num_embeddings, rank)
+        self.B = nn.Parameter(torch.zeros(rank, embedding_dim))
+        self.reset_seed = int(torch.randint(0, 2**31, ()).item())
+        self.reset()
+
+    def forward(self, tokens: Tensor) -> Tensor:
+        return self.A(tokens) @ self.B
+
+    def reset(self):
+        generator = torch.Generator(device=self.A.weight.device)
+        generator.manual_seed(self.reset_seed)
+        with torch.no_grad():
+            self.A.weight.normal_(generator=generator)
+            self.B.zero_()
+
+class LinearLoRA(nn.Module):
+    def __init__(self, in_features: int, out_features: int, rank: int):
+        super().__init__()
+        self.in_features = in_features
+        self.A = nn.Parameter(torch.empty(rank, in_features))
+        self.B = nn.Parameter(torch.zeros(out_features, rank))
+        self.reset_seed = int(torch.randint(0, 2**31, ()).item())
+        self.reset()
+
+    def forward(self, x: Tensor) -> Tensor:
+        return (x @ self.A.T) @ self.B.T
+
+    def reset(self):
+        generator = torch.Generator(device=self.A.device)
+        generator.manual_seed(self.reset_seed)
+        bound = 1.0 / math.sqrt(self.in_features)
+        with torch.no_grad():
+            self.A.uniform_(-bound, bound, generator=generator)
+            self.B.zero_()
+
+class TTTLoRA(nn.Module):
+    def __init__(self, rank: int, model_dim: int, vocab_size: int, bigram_vocab_size: int):
+        super().__init__()
+        self.embed_lora = EmbeddingLoRA(vocab_size, model_dim, rank)
+        self.ve_loras = nn.ModuleList([EmbeddingLoRA(vocab_size, model_dim, rank) for _ in range(3)])
+        self.bigram_lora = EmbeddingLoRA(bigram_vocab_size, model_dim, rank)
+        self.lm_head_lora = LinearLoRA(model_dim, vocab_size, rank)
+
+    def reset(self):
+        for module in self.modules():
+            if isinstance(module, (EmbeddingLoRA, LinearLoRA)):
+                module.reset()
+
+def build_ttt_lora_optimizer(lora: TTTLoRA) -> torch.optim.Optimizer:
+    base_lr = args.ttt_lora_lr
+    return torch.optim.Adam(
+        [
+            {"params": list(lora.embed_lora.parameters()), "lr": base_lr, "betas": (0.5, 0.95)},
+            {"params": list(lora.lm_head_lora.parameters()), "lr": base_lr, "betas": (0.5, 0.95)},
+            {"params": [p for ve in lora.ve_loras for p in ve.parameters()], "lr": base_lr * 75.0, "betas": (0.75, 0.95)},
+            {"params": list(lora.bigram_lora.parameters()), "lr": base_lr * 75.0, "betas": (0.75, 0.95)},
+        ],
+        eps=1e-10,
+    )
+
+# --- Batched LoRA for Phase 2 ---
+
+class BatchedEmbeddingLoRA(nn.Module):
+    def __init__(self, num_seqs: int, num_embeddings: int, embedding_dim: int, rank: int):
+        super().__init__()
+        self.num_seqs = num_seqs
+        self.num_embeddings = num_embeddings
+        self.rank = rank
+        self.A = nn.Parameter(torch.empty(num_seqs, num_embeddings, rank))
+        self.B = nn.Parameter(torch.zeros(num_seqs, rank, embedding_dim))
+        self.reset_seed = int(torch.randint(0, 2**31, ()).item())
+        self.reset()
+
+    @torch.compiler.disable
+    def forward(self, tokens: Tensor, segment_ids: Tensor,
+                seg_offsets: Tensor | None = None) -> Tensor:
+        # Vectorized A lookup: single indexed access, no loop
+        a = self.A[segment_ids, tokens]  # (T, r)
+        out = torch.zeros(tokens.shape[0], self.B.shape[2], device=tokens.device, dtype=self.B.dtype)
+        if seg_offsets is not None:
+            for i in range(seg_offsets.shape[0] - 1):
+                start, end = seg_offsets[i].item(), seg_offsets[i + 1].item()
+                s = segment_ids[start].item()
+                out[start:end] = a[start:end] @ self.B[s]
+        else:
+            # Fallback: boolean mask (slower)
+            for s in range(self.num_seqs):
+                mask = segment_ids == s
+                if mask.any():
+                    out[mask] = a[mask] @ self.B[s]
+        return out
+
+    def reset(self):
+        generator = torch.Generator(device=self.A.device)
+        generator.manual_seed(self.reset_seed)
+        with torch.no_grad():
+            self.A.normal_(generator=generator)
+            self.B.zero_()
+
+class BatchedLinearLoRA(nn.Module):
+    def __init__(self, num_seqs: int, in_features: int, out_features: int, rank: int):
+        super().__init__()
+        self.num_seqs = num_seqs
+        self.in_features = in_features
+        self.A = nn.Parameter(torch.empty(num_seqs, rank, in_features))
+        self.B = nn.Parameter(torch.zeros(num_seqs, out_features, rank))
+        self.reset_seed = int(torch.randint(0, 2**31, ()).item())
+        self.reset()
+
+    @torch.compiler.disable
+    def forward(self, x: Tensor, segment_ids: Tensor,
+                seg_offsets: Tensor | None = None) -> Tensor:
+        out = torch.zeros(x.shape[0], self.B.shape[1], device=x.device, dtype=x.dtype)
+        if seg_offsets is not None:
+            for i in range(seg_offsets.shape[0] - 1):
+                start, end = seg_offsets[i].item(), seg_offsets[i + 1].item()
+                s = segment_ids[start].item()
+                h = x[start:end] @ self.A[s].T
+                out[start:end] = h @ self.B[s].T
+        else:
+            for s in range(self.num_seqs):
+                mask = segment_ids == s
+                if mask.any():
+                    h = x[mask] @ self.A[s].T
+                    out[mask] = h @ self.B[s].T
+        return out
+
+    def reset(self):
+        generator = torch.Generator(device=self.A.device)
+        generator.manual_seed(self.reset_seed)
+        bound = 1.0 / math.sqrt(self.in_features)
+        with torch.no_grad():
+            self.A.uniform_(-bound, bound, generator=generator)
+            self.B.zero_()
+
+class BatchedTTTLoRA(nn.Module):
+    def __init__(self, num_seqs: int, rank: int, model_dim: int, vocab_size: int, bigram_vocab_size: int):
+        super().__init__()
+        self.num_seqs = num_seqs
+        self.embed_lora = BatchedEmbeddingLoRA(num_seqs, vocab_size, model_dim, rank)
+        self.ve_loras = nn.ModuleList([BatchedEmbeddingLoRA(num_seqs, vocab_size, model_dim, rank) for _ in range(3)])
+        self.bigram_lora = BatchedEmbeddingLoRA(num_seqs, bigram_vocab_size, model_dim, rank)
+        self.lm_head_lora = BatchedLinearLoRA(num_seqs, model_dim, vocab_size, rank)
+
+    def reset(self):
+        for module in self.modules():
+            if isinstance(module, (BatchedEmbeddingLoRA, BatchedLinearLoRA)):
+                module.reset()
+
+def build_batched_ttt_lora_optimizer(lora: BatchedTTTLoRA) -> torch.optim.Optimizer:
+    base_lr = args.ttt_lora_lr
+    return torch.optim.Adam(
+        [
+            {"params": list(lora.embed_lora.parameters()), "lr": base_lr, "betas": (0.5, 0.95)},
+            {"params": list(lora.lm_head_lora.parameters()), "lr": base_lr, "betas": (0.5, 0.95)},
+            {"params": [p for ve in lora.ve_loras for p in ve.parameters()], "lr": base_lr * 75.0, "betas": (0.75, 0.95)},
+            {"params": list(lora.bigram_lora.parameters()), "lr": base_lr * 75.0, "betas": (0.75, 0.95)},
+        ],
+        eps=1e-10,
+    )
+
 class GPT(nn.Module):
     def __init__(self, vocab_size: int, num_layers: int, num_heads: int, head_dim: int, model_dim: int, max_seq_len: int):
         super().__init__()
@@ -1222,7 +1387,10 @@ class GPT(nn.Module):
 
     def forward(
         self, input_seq: Tensor, target_seq: Tensor, seqlens: Tensor,
-        bigram_input_seq: Tensor, schedule_cfg: ForwardScheduleConfig, ttt_loss_mask: Tensor | None = None):
+        bigram_input_seq: Tensor, schedule_cfg: ForwardScheduleConfig,
+        ttt_loss_mask: Tensor | None = None, ttt_segment_ids: Tensor | None = None,
+        ttt_embed_delta: Tensor | None = None, ttt_ve_deltas: tuple | None = None,
+        ttt_bigram_delta: Tensor | None = None, ttt_lm_head_lora: object | None = None):
         assert input_seq.ndim == 1
 
         # unpack schedule_cfg
@@ -1253,10 +1421,20 @@ class GPT(nn.Module):
 
         # Embedding lookup - embed is synced from lm_head during tied phase by optimizer
         x = self.embed(input_seq)
-        x0_bigram = self.bigram_embed(bigram_input_seq)[None]
-        
-        # Value embeddings - always computed (not precomputed)
+        x0_bigram = self.bigram_embed(bigram_input_seq)
         ve = [value_embed(input_seq) for value_embed in self.value_embeds]
+        ttt_lora = getattr(self, 'ttt_lora', None)
+        if ttt_lora is not None:
+            x = x + ttt_lora.embed_lora(input_seq)
+            x0_bigram = x0_bigram + ttt_lora.bigram_lora(bigram_input_seq)
+            ve = [v + lora_ve(input_seq) for v, lora_ve in zip(ve, ttt_lora.ve_loras)]
+        if ttt_embed_delta is not None:
+            x = x + ttt_embed_delta
+        if ttt_bigram_delta is not None:
+            x0_bigram = x0_bigram + ttt_bigram_delta
+        if ttt_ve_deltas is not None:
+            ve = [v + d for v, d in zip(ve, ttt_ve_deltas)]
+        x0_bigram = x0_bigram[None]
         # 012 ... 012 structure on token value embeddings by @YouJiacheng, improved on @leloykun's U-net structure
         # dropping first layer updates this to .12 ... 012
         ve = [ve[1], ve[2]] + [None] * (self.num_layers - 5) + [ve[0], ve[1], ve[2]]
@@ -1315,6 +1493,10 @@ class GPT(nn.Module):
         x -= backout_lambda * x_backout
         x = norm(x)
         logits = self.lm_head(x)
+        if ttt_lora is not None:
+            logits = logits + ttt_lora.lm_head_lora(x)
+        elif ttt_lm_head_lora is not None and ttt_segment_ids is not None:
+            logits = logits + ttt_lm_head_lora(x.squeeze(0), ttt_segment_ids).unsqueeze(0)
         # @Grad62304977 added tanh softcapping following Gemma 2 paper, @KoszarskyB reduced it from 30 to 15
         # @YouJiacheng shifted it by +15 (2*sigmoid(2*x)=tanh(x)+1). @classiclarryd updated to 23*sigmoid((logits+5)/7.5)
         if self.training:
@@ -1779,10 +1961,162 @@ def build_single_seq_seqlens(seq_len: int, max_num_docs: int) -> Tensor:
     seqlens[0] = 0
     return seqlens
 
+@dataclass
+class PackedSpan:
+    seq_idx: int
+    src_start: int
+    src_end: int
+    dst_start: int
+    loss_start: int
+    loss_end: int
+
+@dataclass
+class BatchedTTTPackedState:
+    raw_len: int
+    packed_len: int
+    seqlens: Tensor
+    seg_offsets: Tensor
+    spans: tuple[PackedSpan, ...]
+
+@dataclass
+class BatchedTTTChunkPlan:
+    total_chunk_tokens: int
+    eval_state: BatchedTTTPackedState
+    train_state: BatchedTTTPackedState | None
+    can_merge_eval_train: bool = False
+
+def build_batched_ttt_packed_state(
+    boundaries: list[int], spans: list[PackedSpan], max_num_docs: int, pack_multiple: int,
+) -> BatchedTTTPackedState:
+    raw_len = boundaries[-1]
+    packed_len = next_multiple_of_n(raw_len, n=pack_multiple)
+    seqlens_size = max(max_num_docs, len(boundaries))
+    seqlens = torch.full((seqlens_size,), packed_len, dtype=torch.int32, device=device)
+    seqlens[0] = 0
+    if len(boundaries) > 1:
+        seqlens[1:len(boundaries)] = torch.tensor(boundaries[1:], dtype=torch.int32, device=device)
+    seg_offsets = torch.tensor(boundaries, dtype=torch.long, device=device)
+    return BatchedTTTPackedState(
+        raw_len=raw_len,
+        packed_len=packed_len,
+        seqlens=seqlens,
+        seg_offsets=seg_offsets,
+        spans=tuple(spans),
+    )
+
+def build_batched_ttt_chunk_plans(
+    seq_lens: list[int], max_num_docs: int, pack_multiple: int,
+) -> list[BatchedTTTChunkPlan]:
+    seq_num_chunks = [(seq_len + args.ttt_chunk_size - 1) // args.ttt_chunk_size for seq_len in seq_lens]
+    max_chunks = max(seq_num_chunks)
+    chunk_plans = []
+    for chunk_idx in range(max_chunks):
+        chunk_start = chunk_idx * args.ttt_chunk_size
+        eval_spans = []
+        eval_boundaries = [0]
+        train_spans = []
+        train_boundaries = [0]
+        total_chunk_tokens = 0
+
+        for s_idx, seq_len in enumerate(seq_lens):
+            if chunk_idx >= seq_num_chunks[s_idx]:
+                continue
+
+            chunk_end = min(chunk_start + args.ttt_chunk_size, seq_len)
+            chunk_len = chunk_end - chunk_start
+            eval_dst_start = eval_boundaries[-1]
+            eval_src_start = 0 if args.ttt_eval_ctx == 0 else max(0, chunk_start - args.ttt_eval_ctx)
+            eval_len = chunk_end - eval_src_start
+            eval_spans.append(PackedSpan(
+                seq_idx=s_idx,
+                src_start=eval_src_start,
+                src_end=chunk_end,
+                dst_start=eval_dst_start,
+                loss_start=eval_dst_start + (chunk_start - eval_src_start),
+                loss_end=eval_dst_start + eval_len,
+            ))
+            eval_boundaries.append(eval_dst_start + eval_len)
+            total_chunk_tokens += chunk_len
+
+            if chunk_idx >= seq_num_chunks[s_idx] - 1:
+                continue
+
+            train_start = max(0, chunk_end - args.ttt_bs)
+            train_len = chunk_end - train_start
+            prefix_len = chunk_start - train_start
+            train_dst_start = train_boundaries[-1]
+            train_spans.append(PackedSpan(
+                seq_idx=s_idx,
+                src_start=train_start,
+                src_end=chunk_end,
+                dst_start=train_dst_start,
+                loss_start=train_dst_start + prefix_len,
+                loss_end=train_dst_start + prefix_len + chunk_len,
+            ))
+            train_boundaries.append(train_dst_start + train_len)
+
+        train_state = None
+        if len(train_boundaries) > 1:
+            train_state = build_batched_ttt_packed_state(
+                train_boundaries, train_spans, max_num_docs, pack_multiple,
+            )
+
+        can_merge = (
+            train_state is not None
+            and len(eval_spans) == len(train_spans)
+            and args.ttt_eval_ctx == 0
+            and all(es.src_start == 0 and ts.src_start == 0
+                    for es, ts in zip(eval_spans, train_spans))
+        )
+        chunk_plans.append(BatchedTTTChunkPlan(
+            total_chunk_tokens=total_chunk_tokens,
+            eval_state=build_batched_ttt_packed_state(
+                eval_boundaries, eval_spans, max_num_docs, pack_multiple,
+            ),
+            train_state=train_state,
+            can_merge_eval_train=can_merge,
+        ))
+    return chunk_plans
+
+def fill_batched_ttt_buffers(
+    packed_state: BatchedTTTPackedState,
+    seq_data: list[tuple[Tensor, Tensor, Tensor]],
+    input_buf: Tensor,
+    target_buf: Tensor,
+    bigram_buf: Tensor,
+    mask_buf: Tensor,
+    seg_buf: Tensor,
+) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+    packed_len = packed_state.packed_len
+    raw_len = packed_state.raw_len
+    input_buf[raw_len:packed_len].zero_()
+    target_buf[raw_len:packed_len].zero_()
+    bigram_buf[raw_len:packed_len].zero_()
+    mask_buf[:packed_len].zero_()
+    seg_buf[:packed_len].zero_()
+
+    for span in packed_state.spans:
+        seq_inp, seq_tgt, seq_bg = seq_data[span.seq_idx]
+        dst_end = span.dst_start + (span.src_end - span.src_start)
+        input_buf[span.dst_start:dst_end].copy_(seq_inp[span.src_start:span.src_end])
+        target_buf[span.dst_start:dst_end].copy_(seq_tgt[span.src_start:span.src_end])
+        bigram_buf[span.dst_start:dst_end].copy_(seq_bg[span.src_start:span.src_end])
+        seg_buf[span.dst_start:dst_end].fill_(span.seq_idx)
+        mask_buf[span.loss_start:span.loss_end] = True
+
+    return (
+        input_buf[:packed_len],
+        target_buf[:packed_len],
+        bigram_buf[:packed_len],
+        mask_buf[:packed_len],
+        seg_buf[:packed_len],
+    )
+
 def ttt_val_batch(
     inputs: Tensor, targets: Tensor, cum_seqlens: Tensor, bigram_inputs: Tensor,
     fwd_args: ForwardScheduleConfig, initial_model_state: dict | None,
     ttt_window_seqlens: Tensor, max_num_docs: int,
+    external_optimizer: torch.optim.Optimizer | None = None,
 ) -> Tensor:
     """Calculate the loss on a batch when using test-time training.
 
@@ -1815,6 +2149,12 @@ def ttt_val_batch(
         model_raw.load_state_dict(initial_model_state)
         model_raw.zero_grad(set_to_none=True)
         training_manager.optimizer.reset(adam=True, normuon=True, retie_embed=False)
+        if external_optimizer is not None:
+            for state in external_optimizer.state.values():
+                if 'exp_avg' in state:
+                    state['step'].zero_()
+                    state['exp_avg'].zero_()
+                    state['exp_avg_sq'].zero_()
 
         num_chunks = (seq_len + args.ttt_chunk_size - 1) // args.ttt_chunk_size
         for chunk_idx in range(num_chunks):
@@ -1864,11 +2204,253 @@ def ttt_val_batch(
                     ttt_loss_mask=train_mask,
                 )
                 train_loss.backward()
+                if external_optimizer is not None:
+                    external_optimizer.step()
+                    external_optimizer.zero_grad(set_to_none=True)
                 training_manager.step_optimizers(
                     args.num_scheduled_iterations + 1, adam=True, normuon=not args.ttt_adam_only
                 )
 
     # Single sync at the end: reduce loss across all GPUs
+    dist.all_reduce(batch_loss_sum, op=dist.ReduceOp.SUM)
+    dist.all_reduce(batch_tokens, op=dist.ReduceOp.SUM)
+    return batch_loss_sum / batch_tokens
+
+def ttt_val_batch_lora(
+    inputs: Tensor, targets: Tensor, cum_seqlens: Tensor, bigram_inputs: Tensor,
+    fwd_args: ForwardScheduleConfig,
+    ttt_window_seqlens: Tensor, max_num_docs: int,
+    lora: TTTLoRA, lora_optimizer: torch.optim.Optimizer,
+) -> Tensor:
+    """LoRA-based TTT: base model frozen, only LoRA params are trained per sequence."""
+    batch_loss_sum = torch.zeros((), device=device)
+    batch_tokens = torch.zeros((), dtype=torch.int64, device=device)
+
+    buf_inputs = torch.zeros(args.ttt_bs, dtype=inputs.dtype, device=device)
+    buf_targets = torch.zeros(args.ttt_bs, dtype=targets.dtype, device=device)
+    buf_bigram = torch.zeros(args.ttt_bs, dtype=bigram_inputs.dtype, device=device)
+    train_mask = torch.zeros(args.ttt_bs, dtype=torch.bool, device=device)
+
+    boundaries = get_sequence_boundaries(cum_seqlens, inputs.numel())
+    for seq_start, seq_end in boundaries:
+        seq_len = seq_end - seq_start
+        seq_inputs = inputs[seq_start:seq_end]
+        seq_targets = targets[seq_start:seq_end]
+        seq_bigram = bigram_inputs[seq_start:seq_end]
+
+        lora.reset()
+        lora_optimizer.zero_grad(set_to_none=True)
+        for state in lora_optimizer.state.values():
+            for key in ('exp_avg', 'exp_avg_sq'):
+                if key in state:
+                    state[key].zero_()
+            if 'step' in state:
+                state['step'].fill_(0)
+
+        num_chunks = (seq_len + args.ttt_chunk_size - 1) // args.ttt_chunk_size
+        for chunk_idx in range(num_chunks):
+            chunk_start = chunk_idx * args.ttt_chunk_size
+            chunk_end = min(chunk_start + args.ttt_chunk_size, seq_len)
+            chunk_len = chunk_end - chunk_start
+
+            eval_inputs_padded = pad_to_multiple(seq_inputs[:chunk_end], 16)
+            eval_targets_padded = pad_to_multiple(seq_targets[:chunk_end], 16)
+            eval_bigram_padded = pad_to_multiple(seq_bigram[:chunk_end], 16)
+            eval_seqlens = build_single_seq_seqlens(eval_inputs_padded.numel(), max_num_docs)
+            mask = torch.zeros(eval_inputs_padded.numel(), dtype=torch.bool, device=device)
+            mask[chunk_start:chunk_end] = True
+            model.eval()
+            with torch.no_grad():
+                chunk_loss = model(
+                    eval_inputs_padded, eval_targets_padded,
+                    eval_seqlens, eval_bigram_padded, fwd_args,
+                    ttt_loss_mask=mask,
+                )
+            batch_loss_sum += chunk_loss.detach() * chunk_len
+            batch_tokens += chunk_len
+
+            if chunk_idx == num_chunks - 1:
+                continue
+
+            train_start = max(0, chunk_end - args.ttt_bs)
+            L = chunk_end - train_start
+            prefix_len = chunk_start - train_start
+            buf_inputs.zero_()
+            buf_targets.zero_()
+            buf_bigram.zero_()
+            train_mask.zero_()
+            buf_inputs[:L].copy_(seq_inputs[train_start:chunk_end])
+            buf_targets[:L].copy_(seq_targets[train_start:chunk_end])
+            buf_bigram[:L].copy_(seq_bigram[train_start:chunk_end])
+            train_mask[prefix_len:prefix_len + chunk_len] = True
+
+            model.train()
+            for _ in range(args.ttt_grad_steps):
+                train_loss = model(
+                    buf_inputs, buf_targets,
+                    ttt_window_seqlens, buf_bigram, fwd_args,
+                    ttt_loss_mask=train_mask,
+                )
+                train_loss.backward()
+                lora_optimizer.step()
+                lora_optimizer.zero_grad(set_to_none=True)
+
+    dist.all_reduce(batch_loss_sum, op=dist.ReduceOp.SUM)
+    dist.all_reduce(batch_tokens, op=dist.ReduceOp.SUM)
+    return batch_loss_sum / batch_tokens
+
+def ttt_val_batch_batched(
+    inputs: Tensor, targets: Tensor, cum_seqlens: Tensor, bigram_inputs: Tensor,
+    fwd_args: ForwardScheduleConfig,
+    max_num_docs: int, sub_batch_size: int,
+    batched_lora: BatchedTTTLoRA, batched_lora_optimizer: torch.optim.Optimizer,
+) -> Tensor:
+    """Batched LoRA TTT: process sub_batch_size sequences in parallel per forward pass."""
+    batch_loss_sum = torch.zeros((), device=device)
+    batch_tokens = torch.zeros((), dtype=torch.int64, device=device)
+
+    boundaries = get_sequence_boundaries(cum_seqlens, inputs.numel())
+    boundaries.sort(key=lambda b: b[1] - b[0])
+    pack_multiple = args.ttt_lora_pack_multiple
+
+    for sub_start in range(0, len(boundaries), sub_batch_size):
+        sub_bounds = boundaries[sub_start : sub_start + sub_batch_size]
+
+        seq_data = []
+        for seq_start, seq_end in sub_bounds:
+            seq_data.append((
+                inputs[seq_start:seq_end],
+                targets[seq_start:seq_end],
+                bigram_inputs[seq_start:seq_end],
+            ))
+        seq_lens = [d[0].numel() for d in seq_data]
+        chunk_plans = build_batched_ttt_chunk_plans(seq_lens, max_num_docs, pack_multiple)
+        eval_max_packed_len = max(plan.eval_state.packed_len for plan in chunk_plans)
+        train_max_packed_len = max(
+            (plan.train_state.packed_len for plan in chunk_plans if plan.train_state is not None),
+            default=0,
+        )
+        eval_inputs_buf = torch.empty(eval_max_packed_len, dtype=inputs.dtype, device=device)
+        eval_targets_buf = torch.empty(eval_max_packed_len, dtype=targets.dtype, device=device)
+        eval_bigram_buf = torch.empty(eval_max_packed_len, dtype=bigram_inputs.dtype, device=device)
+        eval_mask_buf = torch.empty(eval_max_packed_len, dtype=torch.bool, device=device)
+        eval_seg_buf = torch.empty(eval_max_packed_len, dtype=torch.int32, device=device)
+        if train_max_packed_len > 0:
+            train_inputs_buf = torch.empty(train_max_packed_len, dtype=inputs.dtype, device=device)
+            train_targets_buf = torch.empty(train_max_packed_len, dtype=targets.dtype, device=device)
+            train_bigram_buf = torch.empty(train_max_packed_len, dtype=bigram_inputs.dtype, device=device)
+            train_mask_buf = torch.empty(train_max_packed_len, dtype=torch.bool, device=device)
+            train_seg_buf = torch.empty(train_max_packed_len, dtype=torch.int32, device=device)
+        else:
+            train_inputs_buf = train_targets_buf = train_bigram_buf = None
+            train_mask_buf = train_seg_buf = None
+
+        # Reset LoRA and optimizer for this sub-batch
+        batched_lora.reset()
+        batched_lora_optimizer.zero_grad(set_to_none=True)
+        for state in batched_lora_optimizer.state.values():
+            for key in ('exp_avg', 'exp_avg_sq'):
+                if key in state:
+                    state[key].zero_()
+            if 'step' in state:
+                state['step'].fill_(0)
+
+        for chunk_plan in chunk_plans:
+            if chunk_plan.can_merge_eval_train:
+                # Merged path: eval and train cover identical tokens/masks.
+                # One forward (with grad) serves as both eval loss and training loss.
+                train_state = chunk_plan.train_state
+                packed_train_inp, packed_train_tgt, packed_train_bg, packed_train_mask, packed_train_seg = fill_batched_ttt_buffers(
+                    train_state, seq_data,
+                    train_inputs_buf, train_targets_buf, train_bigram_buf, train_mask_buf, train_seg_buf,
+                )
+                train_lm_head_fn = lambda x, seg: batched_lora.lm_head_lora(x, seg, train_state.seg_offsets)
+                model.train()
+                t_embed_delta = batched_lora.embed_lora(packed_train_inp, packed_train_seg, train_state.seg_offsets)
+                t_bigram_delta = batched_lora.bigram_lora(packed_train_bg, packed_train_seg, train_state.seg_offsets)
+                t_ve_deltas = tuple(
+                    ve_lora(packed_train_inp, packed_train_seg, train_state.seg_offsets)
+                    for ve_lora in batched_lora.ve_loras
+                )
+                train_loss = model(
+                    packed_train_inp, packed_train_tgt, train_state.seqlens, packed_train_bg, fwd_args,
+                    ttt_loss_mask=packed_train_mask, ttt_segment_ids=packed_train_seg,
+                    ttt_embed_delta=t_embed_delta, ttt_ve_deltas=t_ve_deltas,
+                    ttt_bigram_delta=t_bigram_delta, ttt_lm_head_lora=train_lm_head_fn,
+                )
+                batch_loss_sum += train_loss.detach()
+                batch_tokens += chunk_plan.total_chunk_tokens
+                train_loss.backward()
+                batched_lora_optimizer.step()
+                batched_lora_optimizer.zero_grad(set_to_none=True)
+                for _ in range(args.ttt_grad_steps - 1):
+                    t_embed_delta = batched_lora.embed_lora(packed_train_inp, packed_train_seg, train_state.seg_offsets)
+                    t_bigram_delta = batched_lora.bigram_lora(packed_train_bg, packed_train_seg, train_state.seg_offsets)
+                    t_ve_deltas = tuple(
+                        ve_lora(packed_train_inp, packed_train_seg, train_state.seg_offsets)
+                        for ve_lora in batched_lora.ve_loras
+                    )
+                    train_loss = model(
+                        packed_train_inp, packed_train_tgt, train_state.seqlens, packed_train_bg, fwd_args,
+                        ttt_loss_mask=packed_train_mask, ttt_segment_ids=packed_train_seg,
+                        ttt_embed_delta=t_embed_delta, ttt_ve_deltas=t_ve_deltas,
+                        ttt_bigram_delta=t_bigram_delta, ttt_lm_head_lora=train_lm_head_fn,
+                    )
+                    train_loss.backward()
+                    batched_lora_optimizer.step()
+                    batched_lora_optimizer.zero_grad(set_to_none=True)
+                continue
+
+            # Standard path: separate eval (no_grad) + train (grad)
+            eval_state = chunk_plan.eval_state
+            packed_inp, packed_tgt, packed_bg, packed_mask, packed_seg = fill_batched_ttt_buffers(
+                eval_state, seq_data,
+                eval_inputs_buf, eval_targets_buf, eval_bigram_buf, eval_mask_buf, eval_seg_buf,
+            )
+            model.eval()
+            with torch.no_grad():
+                embed_delta = batched_lora.embed_lora(packed_inp, packed_seg, eval_state.seg_offsets)
+                bigram_delta = batched_lora.bigram_lora(packed_bg, packed_seg, eval_state.seg_offsets)
+                ve_deltas = tuple(
+                    ve_lora(packed_inp, packed_seg, eval_state.seg_offsets) for ve_lora in batched_lora.ve_loras
+                )
+                lm_head_fn = lambda x, seg: batched_lora.lm_head_lora(x, seg, eval_state.seg_offsets)
+                chunk_loss = model(
+                    packed_inp, packed_tgt, eval_state.seqlens, packed_bg, fwd_args,
+                    ttt_loss_mask=packed_mask, ttt_segment_ids=packed_seg,
+                    ttt_embed_delta=embed_delta, ttt_ve_deltas=ve_deltas,
+                    ttt_bigram_delta=bigram_delta, ttt_lm_head_lora=lm_head_fn,
+                )
+            batch_loss_sum += chunk_loss.detach() * chunk_plan.total_chunk_tokens
+            batch_tokens += chunk_plan.total_chunk_tokens
+
+            train_state = chunk_plan.train_state
+            if train_state is None:
+                continue
+
+            packed_train_inp, packed_train_tgt, packed_train_bg, packed_train_mask, packed_train_seg = fill_batched_ttt_buffers(
+                train_state, seq_data,
+                train_inputs_buf, train_targets_buf, train_bigram_buf, train_mask_buf, train_seg_buf,
+            )
+            train_lm_head_fn = lambda x, seg: batched_lora.lm_head_lora(x, seg, train_state.seg_offsets)
+            model.train()
+            for _ in range(args.ttt_grad_steps):
+                t_embed_delta = batched_lora.embed_lora(packed_train_inp, packed_train_seg, train_state.seg_offsets)
+                t_bigram_delta = batched_lora.bigram_lora(packed_train_bg, packed_train_seg, train_state.seg_offsets)
+                t_ve_deltas = tuple(
+                    ve_lora(packed_train_inp, packed_train_seg, train_state.seg_offsets)
+                    for ve_lora in batched_lora.ve_loras
+                )
+                train_loss = model(
+                    packed_train_inp, packed_train_tgt, train_state.seqlens, packed_train_bg, fwd_args,
+                    ttt_loss_mask=packed_train_mask, ttt_segment_ids=packed_train_seg,
+                    ttt_embed_delta=t_embed_delta, ttt_ve_deltas=t_ve_deltas,
+                    ttt_bigram_delta=t_bigram_delta, ttt_lm_head_lora=train_lm_head_fn,
+                )
+                train_loss.backward()
+                batched_lora_optimizer.step()
+                batched_lora_optimizer.zero_grad(set_to_none=True)
+
     dist.all_reduce(batch_loss_sum, op=dist.ReduceOp.SUM)
     dist.all_reduce(batch_tokens, op=dist.ReduceOp.SUM)
     return batch_loss_sum / batch_tokens
@@ -1896,7 +2478,7 @@ class Hyperparameters:
     # evaluation and logging
     run_id: str = f"{uuid.uuid4()}"
     val_loss_every: int = 250  # every how many steps to evaluate val loss? 0 for only at the end
-    save_checkpoint: bool = False
+    save_checkpoint: bool = True
     # attention masking
     block_size: int = 128
     ws_schedule: tuple = (3, 7, 11)
@@ -1904,14 +2486,26 @@ class Hyperparameters:
     ws_validate_post_yarn_ext: int = 20 # extend long windows out even further after applying YaRN
     # bigram hash embedding
     bigram_vocab_size = 50304 * 5
+    # Resume from checkpoint (skip training, go straight to TTT eval)
+    resume_from: str = os.environ.get("RESUME_FROM", "")
     # TTT (test-time training)
-    ttt: bool = True
+    ttt: bool = os.environ.get("TTT", "1") == "1"
     ttt_lr_mult: float = 1.0            # multiply LR by this factor during TTT
     ttt_wd_mult: float = 0.1            # multiply weight decay by this factor during TTT
     ttt_grad_steps: int = 1             # num gradient steps per batch
-    ttt_chunk_size: int = 512           # tokens per chunk for chunked TTT
-    ttt_bs: int = train_max_seq_len     # tokens per GPU for TTT context window
+    ttt_chunk_size: int = int(os.environ.get("TTT_CHUNK_SIZE", "512"))           # tokens per chunk for chunked TTT
+    ttt_bs: int = int(os.environ.get("TTT_BS", str(train_max_seq_len)))     # tokens per GPU for TTT context window
     ttt_adam_only: bool = True          # only update Adam params, freeze NorMuon
+    ttt_ablation: str = os.environ.get("TTT_ABLATION", "")  # "freeze_shared" or "adam_projections"
+    ttt_proj_lr: float = float(os.environ.get("TTT_PROJ_LR", "0.001"))
+    ttt_lora: bool = os.environ.get("TTT_LORA", "") == "1"
+    ttt_lora_rank: int = int(os.environ.get("TTT_LORA_RANK", "8"))
+    ttt_lora_lr: float = float(os.environ.get("TTT_LORA_LR", "0.001"))  # embed/lm_head lr; value/bigram use 75x
+    ttt_lora_batched: bool = os.environ.get("TTT_LORA_BATCHED", "") == "1"
+    ttt_lora_sub_batch: int = int(os.environ.get("TTT_LORA_SUB_BATCH", "32"))
+    ttt_lora_pack_multiple: int = int(os.environ.get("TTT_LORA_PACK_MULTIPLE", "2048"))
+    ttt_lora_batched_dynamic: bool = os.environ.get("TTT_LORA_BATCHED_DYNAMIC", "1") == "1"
+    ttt_eval_ctx: int = int(os.environ.get("TTT_EVAL_CTX", "0"))  # 0 = full prefix; >0 = max prefix tokens before chunk_start
 
 args = Hyperparameters()
 
@@ -1919,6 +2513,8 @@ if not args.ttt_adam_only:
     raise ValueError("Local mode on GPUs (needed for TTT) only implemented for Adam.")
 assert args.ttt_chunk_size % 16 == 0, "ttt_chunk_size must be multiple of 16"
 assert args.ttt_bs % 16 == 0, "ttt_bs must be multiple of 16"
+assert args.ttt_lora_pack_multiple >= 16 and args.ttt_lora_pack_multiple % 16 == 0, \
+    "ttt_lora_pack_multiple must be >= 16 and a multiple of 16"
 
 data_path = os.environ.get("DATA_PATH", ".")
 args.train_files = os.path.join(data_path, args.train_files)
@@ -2022,6 +2618,167 @@ del val_loader, train_loader, initial_state
 model.train()
 
 ########################################
+#     Resume from checkpoint (TTT)     #
+########################################
+if args.resume_from:
+    print0(f"Resuming from checkpoint: {args.resume_from}", console=True)
+    checkpoint = torch.load(args.resume_from, map_location=device, weights_only=False)
+    model_raw.load_state_dict(checkpoint["model"])
+    del checkpoint
+
+    # Replay YaRN schedule to restore rotary embedding state
+    training_manager.reset()
+    for step in range(args.num_iterations + 1):
+        training_manager.advance_schedule(step)
+    training_manager.apply_final_ws_ext()
+    training_manager.optimizer.split_embed = True
+
+    # Run validation (with optional TTT)
+    val_start_t0 = time.perf_counter()
+    model.eval()
+    val_steps = grad_accum_steps * args.val_tokens // args.val_batch_size
+    val_loader = distributed_data_generator(
+        args.val_files, args.val_batch_size, -1,
+        grad_accum_steps=grad_accum_steps, align_to_bos=False,
+    )
+    val_loss = 0
+
+    max_num_docs = next_multiple_of_n(
+        args.val_batch_size // (grad_accum_steps * world_size) // 300, n=128
+    )
+    ttt_window_seqlens = build_single_seq_seqlens(args.ttt_bs, max_num_docs)
+
+    if args.ttt and args.ttt_lora and args.ttt_lora_batched:
+        S = args.ttt_lora_sub_batch
+        print0(
+            f"Starting BATCHED LoRA TTT (rank={args.ttt_lora_rank}, embed_lr={args.ttt_lora_lr}, "
+            f"value_lr={args.ttt_lora_lr * 75.0}, sub_batch={S}, chunk_size={args.ttt_chunk_size}, "
+            f"ttt_bs={args.ttt_bs}, pack_multiple={args.ttt_lora_pack_multiple}, "
+            f"eval_ctx={args.ttt_eval_ctx}, dynamic={args.ttt_lora_batched_dynamic})",
+            console=True,
+        )
+        for p in model_raw.parameters():
+            p.requires_grad_(False)
+        vocab_size = next_multiple_of_n(50257, n=128)
+        batched_lora = BatchedTTTLoRA(
+            S, args.ttt_lora_rank, 768, vocab_size, args.bigram_vocab_size,
+        ).to(device=device, dtype=torch.bfloat16)
+        model = torch.compile(model_raw, dynamic=args.ttt_lora_batched_dynamic)
+        blora_optimizer = build_batched_ttt_lora_optimizer(batched_lora)
+
+        for i in range(val_steps):
+            inputs, targets, cum_seqlens, bigram_inputs = next(val_loader)
+            batch_loss = ttt_val_batch_batched(
+                inputs, targets, cum_seqlens, bigram_inputs,
+                training_manager.get_forward_args(),
+                max_num_docs=max_num_docs, sub_batch_size=S,
+                batched_lora=batched_lora, batched_lora_optimizer=blora_optimizer,
+            )
+            val_loss += batch_loss
+            val_time_ms = 1000 * (time.perf_counter() - val_start_t0)
+            print0(
+                f"val_step:{i+1}/{val_steps} val_loss:{val_loss/(i+1):.4f} "
+                f"val_time:{val_time_ms:.0f}ms step_avg:{val_time_ms / (i + 1):.2f}ms",
+                console=True,
+            )
+    elif args.ttt and args.ttt_lora:
+        print0(
+            f"Starting LoRA TTT (rank={args.ttt_lora_rank}, embed_lr={args.ttt_lora_lr}, "
+            f"value_lr={args.ttt_lora_lr * 75.0}, chunk_size={args.ttt_chunk_size}, ttt_bs={args.ttt_bs})",
+            console=True,
+        )
+        for p in model_raw.parameters():
+            p.requires_grad_(False)
+        vocab_size = next_multiple_of_n(50257, n=128)
+        model_raw.ttt_lora = TTTLoRA(
+            args.ttt_lora_rank, 768, vocab_size, args.bigram_vocab_size,
+        ).to(device=device, dtype=torch.bfloat16)
+        model = torch.compile(model_raw, dynamic=True, fullgraph=True)
+        lora_optimizer = build_ttt_lora_optimizer(model_raw.ttt_lora)
+
+        for i in range(val_steps):
+            inputs, targets, cum_seqlens, bigram_inputs = next(val_loader)
+            batch_loss = ttt_val_batch_lora(
+                inputs, targets, cum_seqlens, bigram_inputs,
+                training_manager.get_forward_args(),
+                ttt_window_seqlens=ttt_window_seqlens, max_num_docs=max_num_docs,
+                lora=model_raw.ttt_lora, lora_optimizer=lora_optimizer,
+            )
+            val_loss += batch_loss
+            val_time_ms = 1000 * (time.perf_counter() - val_start_t0)
+            print0(
+                f"val_step:{i+1}/{val_steps} val_loss:{val_loss/(i+1):.4f} "
+                f"val_time:{val_time_ms:.0f}ms step_avg:{val_time_ms / (i + 1):.2f}ms",
+                console=True,
+            )
+    elif args.ttt:
+        print0("Starting TTT (can take a few minutes)", console=True)
+        model = torch.compile(model_raw, dynamic=True, fullgraph=True)
+        training_manager.model = model
+
+        for p, p_cfg in training_manager.optimizer.param_cfgs.items():
+            p_cfg.initial_lr *= args.ttt_lr_mult
+            p_cfg.weight_decay *= args.ttt_wd_mult
+            if args.ttt_adam_only and p_cfg.optim == "normuon":
+                p.requires_grad_(False)
+
+        ttt_proj_optimizer = None
+        if args.ttt_ablation == "freeze_shared":
+            shared_labels = {"scalars", "smear_gate", "skip_gate", "attn_gate_bank", "ve_gate_bank", "x0_lambdas"}
+            for p, p_cfg in training_manager.optimizer.param_cfgs.items():
+                if p_cfg.label in shared_labels:
+                    p.requires_grad_(False)
+            print0("Ablation: freeze_shared — froze small shared params", console=True)
+        elif args.ttt_ablation == "adam_projections":
+            for p, p_cfg in training_manager.optimizer.param_cfgs.items():
+                if p_cfg.optim == "adam":
+                    p.requires_grad_(False)
+            model_raw.attn_bank.requires_grad_(True)
+            model_raw.mlp_bank.requires_grad_(True)
+            ttt_proj_optimizer = torch.optim.Adam(
+                [model_raw.attn_bank, model_raw.mlp_bank],
+                lr=args.ttt_proj_lr,
+                weight_decay=0.0,
+            )
+            print0(f"Ablation: adam_projections (lr={args.ttt_proj_lr})", console=True)
+
+        initial_model_state = copy.deepcopy(model_raw.state_dict())
+        training_manager.optimizer.enable_local_mode()
+
+        for i in range(val_steps):
+            inputs, targets, cum_seqlens, bigram_inputs = next(val_loader)
+            batch_loss = ttt_val_batch(
+                inputs, targets, cum_seqlens, bigram_inputs,
+                training_manager.get_forward_args(), initial_model_state,
+                ttt_window_seqlens=ttt_window_seqlens, max_num_docs=max_num_docs,
+                external_optimizer=ttt_proj_optimizer,
+            )
+            val_loss += batch_loss
+            val_time_ms = 1000 * (time.perf_counter() - val_start_t0)
+            print0(
+                f"val_step:{i+1}/{val_steps} val_loss:{val_loss/(i+1):.4f} "
+                f"val_time:{val_time_ms:.0f}ms step_avg:{val_time_ms / (i + 1):.2f}ms",
+                console=True,
+            )
+    else:
+        with torch.no_grad():
+            for _ in range(val_steps):
+                inputs, targets, cum_seqlens, bigram_inputs = next(val_loader)
+                val_loss += model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args())
+
+    val_loss /= val_steps
+    del val_loader
+    dist.reduce(val_loss, 0, op=dist.ReduceOp.AVG)
+    val_time_ms = 1000 * (time.perf_counter() - val_start_t0)
+    print0(f"resume val_loss:{val_loss:.4f} val_time:{val_time_ms:.0f}ms", console=True)
+    print0(
+        f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
+        f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True,
+    )
+    dist.destroy_process_group()
+    sys.exit(0)
+
+########################################
 #        Training and validation       #
 ########################################
 train_loader = distributed_data_generator(args.train_files, args.train_bs_schedule[0], args.train_max_seq_len, grad_accum_steps=grad_accum_steps)
@@ -2052,35 +2809,131 @@ for step in range(train_steps + 1):
         val_loss = 0
 
         if last_step and args.ttt:
-            print0("Starting TTT (can take a few minutes)", console=True)
-            model = torch.compile(model_raw, dynamic=True, fullgraph=True)
-            training_manager.model = model
-
-            for p, p_cfg in training_manager.optimizer.param_cfgs.items():
-                p_cfg.initial_lr *= args.ttt_lr_mult
-                p_cfg.weight_decay *= args.ttt_wd_mult
-                if args.ttt_adam_only and p_cfg.optim == "normuon":
-                    p.requires_grad_(False)
             max_num_docs = next_multiple_of_n(
                 args.val_batch_size // (grad_accum_steps * world_size) // 300, n=128
             )
             ttt_window_seqlens = build_single_seq_seqlens(args.ttt_bs, max_num_docs)
-            initial_model_state = copy.deepcopy(model_raw.state_dict())
-            training_manager.optimizer.enable_local_mode()  # Keep GPU opt states separate.
 
-            for i in range(val_steps):
-                inputs, targets, cum_seqlens, bigram_inputs = next(val_loader)
-                batch_loss = ttt_val_batch(
-                    inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args(),
-                    initial_model_state,  ttt_window_seqlens=ttt_window_seqlens,
-                    max_num_docs=max_num_docs,
-                )
-                val_loss += batch_loss
-                val_time_ms = 1000 * (time.perf_counter() - val_start_t0)
+            if master_process and args.save_checkpoint:
+                os.makedirs(f"logs/{run_id}", exist_ok=True)
+                torch.save(dict(step=step, code=code, model=model_raw.state_dict(), optimizer=training_manager.get_state()),
+                           f"logs/{run_id}/state_pre_ttt.pt")
+                print0(f"Saved pre-TTT checkpoint to logs/{run_id}/state_pre_ttt.pt", console=True)
+
+            if args.ttt_lora and args.ttt_lora_batched:
+                S = args.ttt_lora_sub_batch
                 print0(
-                    f"val_step:{i+1}/{val_steps} val_loss:{val_loss/(i+1):.4f} "
-                    f"val_time:{val_time_ms:.0f}ms step_avg:{val_time_ms / (i + 1):.2f}ms",
-                    console=True)
+                    f"Starting BATCHED LoRA TTT (rank={args.ttt_lora_rank}, embed_lr={args.ttt_lora_lr}, "
+                    f"value_lr={args.ttt_lora_lr * 75.0}, sub_batch={S}, pack_multiple={args.ttt_lora_pack_multiple}, "
+                    f"dynamic={args.ttt_lora_batched_dynamic})",
+                    console=True,
+                )
+                for p in model_raw.parameters():
+                    p.requires_grad_(False)
+                vocab_size = next_multiple_of_n(50257, n=128)
+                batched_lora = BatchedTTTLoRA(
+                    S, args.ttt_lora_rank, 768, vocab_size, args.bigram_vocab_size,
+                ).to(device=device, dtype=torch.bfloat16)
+                model = torch.compile(model_raw, dynamic=args.ttt_lora_batched_dynamic)
+                blora_optimizer = build_batched_ttt_lora_optimizer(batched_lora)
+            elif args.ttt_lora:
+                print0(
+                    f"Starting LoRA TTT (rank={args.ttt_lora_rank}, embed_lr={args.ttt_lora_lr}, "
+                    f"value_lr={args.ttt_lora_lr * 75.0})",
+                    console=True,
+                )
+                for p in model_raw.parameters():
+                    p.requires_grad_(False)
+                vocab_size = next_multiple_of_n(50257, n=128)
+                model_raw.ttt_lora = TTTLoRA(
+                    args.ttt_lora_rank, 768, vocab_size, args.bigram_vocab_size,
+                ).to(device=device, dtype=torch.bfloat16)
+                model = torch.compile(model_raw, dynamic=True, fullgraph=True)
+                lora_optimizer = build_ttt_lora_optimizer(model_raw.ttt_lora)
+
+            if args.ttt_lora and args.ttt_lora_batched:
+                for i in range(val_steps):
+                    inputs, targets, cum_seqlens, bigram_inputs = next(val_loader)
+                    batch_loss = ttt_val_batch_batched(
+                        inputs, targets, cum_seqlens, bigram_inputs,
+                        training_manager.get_forward_args(),
+                        max_num_docs=max_num_docs, sub_batch_size=S,
+                        batched_lora=batched_lora, batched_lora_optimizer=blora_optimizer,
+                    )
+                    val_loss += batch_loss
+                    val_time_ms = 1000 * (time.perf_counter() - val_start_t0)
+                    print0(
+                        f"val_step:{i+1}/{val_steps} val_loss:{val_loss/(i+1):.4f} "
+                        f"val_time:{val_time_ms:.0f}ms step_avg:{val_time_ms / (i + 1):.2f}ms",
+                        console=True)
+            elif args.ttt_lora:
+                for i in range(val_steps):
+                    inputs, targets, cum_seqlens, bigram_inputs = next(val_loader)
+                    batch_loss = ttt_val_batch_lora(
+                        inputs, targets, cum_seqlens, bigram_inputs,
+                        training_manager.get_forward_args(),
+                        ttt_window_seqlens=ttt_window_seqlens, max_num_docs=max_num_docs,
+                        lora=model_raw.ttt_lora, lora_optimizer=lora_optimizer,
+                    )
+                    val_loss += batch_loss
+                    val_time_ms = 1000 * (time.perf_counter() - val_start_t0)
+                    print0(
+                        f"val_step:{i+1}/{val_steps} val_loss:{val_loss/(i+1):.4f} "
+                        f"val_time:{val_time_ms:.0f}ms step_avg:{val_time_ms / (i + 1):.2f}ms",
+                        console=True)
+            else:
+                print0("Starting TTT (can take a few minutes)", console=True)
+                model = torch.compile(model_raw, dynamic=True, fullgraph=True)
+                training_manager.model = model
+
+                for p, p_cfg in training_manager.optimizer.param_cfgs.items():
+                    p_cfg.initial_lr *= args.ttt_lr_mult
+                    p_cfg.weight_decay *= args.ttt_wd_mult
+                    if args.ttt_adam_only and p_cfg.optim == "normuon":
+                        p.requires_grad_(False)
+
+                ttt_proj_optimizer = None
+                if args.ttt_ablation == "freeze_shared":
+                    shared_labels = {"scalars", "smear_gate", "skip_gate", "attn_gate_bank", "ve_gate_bank", "x0_lambdas"}
+                    for p, p_cfg in training_manager.optimizer.param_cfgs.items():
+                        if p_cfg.label in shared_labels:
+                            p.requires_grad_(False)
+                    print0("Ablation: freeze_shared — froze small shared params", console=True)
+                elif args.ttt_ablation == "adam_projections":
+                    for p, p_cfg in training_manager.optimizer.param_cfgs.items():
+                        if p_cfg.optim == "adam":
+                            p.requires_grad_(False)
+                    model_raw.attn_bank.requires_grad_(True)
+                    model_raw.mlp_bank.requires_grad_(True)
+                    ttt_proj_optimizer = torch.optim.Adam(
+                        [model_raw.attn_bank, model_raw.mlp_bank],
+                        lr=args.ttt_proj_lr,
+                        weight_decay=0.0,
+                    )
+                    print0(f"Ablation: adam_projections (lr={args.ttt_proj_lr})", console=True)
+
+                initial_model_state = copy.deepcopy(model_raw.state_dict())
+                if master_process and args.save_checkpoint:
+                    os.makedirs(f"logs/{run_id}", exist_ok=True)
+                    torch.save(dict(step=step, code=code, model=initial_model_state, optimizer=training_manager.get_state()),
+                               f"logs/{run_id}/state_pre_ttt.pt")
+                    print0(f"Saved pre-TTT checkpoint to logs/{run_id}/state_pre_ttt.pt", console=True)
+                training_manager.optimizer.enable_local_mode()
+
+                for i in range(val_steps):
+                    inputs, targets, cum_seqlens, bigram_inputs = next(val_loader)
+                    batch_loss = ttt_val_batch(
+                        inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args(),
+                        initial_model_state, ttt_window_seqlens=ttt_window_seqlens,
+                        max_num_docs=max_num_docs,
+                        external_optimizer=ttt_proj_optimizer,
+                    )
+                    val_loss += batch_loss
+                    val_time_ms = 1000 * (time.perf_counter() - val_start_t0)
+                    print0(
+                        f"val_step:{i+1}/{val_steps} val_loss:{val_loss/(i+1):.4f} "
+                        f"val_time:{val_time_ms:.0f}ms step_avg:{val_time_ms / (i + 1):.2f}ms",
+                        console=True)
         else:
             with torch.no_grad():
                 for _ in range(val_steps):
@@ -2103,7 +2956,8 @@ for step in range(train_steps + 1):
         if master_process and args.save_checkpoint:
             log = dict(step=step, code=code, model=model_raw.state_dict(), optimizer=training_manager.get_state())
             os.makedirs(f"logs/{run_id}", exist_ok=True)
-            torch.save(log, f"logs/{run_id}/state_step{step:06d}.pt")
+            torch.save(log, f"logs/{run_id}/state_post_ttt.pt")
+            print0(f"Saved post-TTT checkpoint to logs/{run_id}/state_post_ttt.pt", console=True)
         # the last step only has the validation loop, so break to avoid training
         break
 
