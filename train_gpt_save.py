@@ -8,6 +8,7 @@ with open(os.path.join(os.path.dirname(sys.argv[0]), 'triton_kernels.py'), 'r') 
     code += f"\n\n{'-'*40}\n# triton_kernels.py\n{'-'*40}\n\n"
     code += f.read()
 
+import argparse
 import copy
 import glob
 import math
@@ -1575,6 +1576,7 @@ class Hyperparameters:
     val_loss_every: int = 250  # every how many steps to evaluate val loss? 0 for only at the end
     save_checkpoint: bool = False
     run_evals: bool = False  # run additional evaluations after training is completed
+    eval_only_run_id: str | None = None
     late_checkpoint_window: int = 30
     late_checkpoint_stride: int = 2
     run_posthoc_averaging: bool = True
@@ -1585,6 +1587,13 @@ class Hyperparameters:
     bigram_vocab_size: int = 50304 * 5
 
 args = Hyperparameters()
+
+cli_parser = argparse.ArgumentParser()
+cli_parser.add_argument("--eval-only-run-id", type=str, help="Skip training and only run posthoc evals from logs_save/<run_id>/late_models.")
+cli_args, _ = cli_parser.parse_known_args()
+args.eval_only_run_id = cli_args.eval_only_run_id
+if args.eval_only_run_id is not None:
+    args.run_id = args.eval_only_run_id
 
 @dataclass(slots=True)
 class TrainingStage:
@@ -1882,6 +1891,11 @@ def late_checkpoint_step_indices(train_steps: int, window: int, stride: int) -> 
 def late_checkpoint_path(run_dir: Path, step: int) -> Path:
     return run_dir / "late_models" / f"model_step{step + 1:06d}.pt"
 
+def late_checkpoint_paths_for_run(run_id: str, train_steps: int) -> list[Path]:
+    late_steps = late_checkpoint_step_indices(train_steps, args.late_checkpoint_window, args.late_checkpoint_stride)
+    run_dir = Path("logs_save") / run_id
+    return [late_checkpoint_path(run_dir, step) for step in late_steps]
+
 def save_late_model_checkpoint(model: nn.Module, path: Path):
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(copy_model_state_cpu(model), path)
@@ -1924,6 +1938,12 @@ def ema_weights_from_steps(steps: list[int], half_life: int) -> list[float]:
     last_step = steps[-1]
     return [math.exp(-math.log(2) * (last_step - step) / half_life) for step in steps]
 
+def advance_to_final_eval_schedule(training_manager, train_steps: int):
+    training_manager.reset()
+    for step in range(train_steps + 1):
+        training_manager.advance_schedule(step)
+    training_manager.apply_final_ws_ext()
+
 @torch.no_grad()
 def evaluate_val_loss(eval_model: nn.Module, schedule_cfg: ForwardScheduleConfig):
     eval_model.eval()
@@ -1938,29 +1958,11 @@ def evaluate_val_loss(eval_model: nn.Module, schedule_cfg: ForwardScheduleConfig
     dist.reduce(val_loss, 0, op=dist.ReduceOp.AVG)
     return float(val_loss) if master_process else None
 
-def build_eval_model() -> nn.Module:
-    eval_model = GPT(
-        vocab_size=50257,
-        num_layers=11,
-        num_heads=6,
-        head_dim=128,
-        model_dim=768,
-        max_seq_len=args.val_batch_size // (grad_accum_steps * world_size)
-    ).cuda()
-    for m in eval_model.modules():
-        if isinstance(m, (nn.Embedding, nn.Linear)):
-            m.weight.data = m.weight.data.bfloat16()
-    eval_model.attn_gate_bank.data = eval_model.attn_gate_bank.data.bfloat16()
-    eval_model.ve_gate_bank.data = eval_model.ve_gate_bank.data.bfloat16()
-    eval_model.qk_bank.data = eval_model.qk_bank.data.bfloat16()
-    eval_model.vo_bank.data = eval_model.vo_bank.data.bfloat16()
-    eval_model.mlp_bank.data = eval_model.mlp_bank.data.bfloat16()
-    return eval_model.eval()
-
 @torch.no_grad()
-def evaluate_logit_average(ensemble_models: list[nn.Module], schedule_cfg: ForwardScheduleConfig):
-    for model in ensemble_models:
-        model.eval()
+def evaluate_logit_average(model: nn.Module, ckpt_paths: list[Path], schedule_cfg: ForwardScheduleConfig):
+    """Load each checkpoint sequentially into `model`, accumulate logits, compute loss."""
+    model_io = get_model_io(model)
+    model.eval()
     assert args.val_tokens % args.val_batch_size == 0
     val_steps = grad_accum_steps * args.val_tokens // args.val_batch_size
     val_loader = distributed_data_generator(args.val_files, args.val_batch_size, -1, grad_accum_steps=grad_accum_steps, align_to_bos=False)
@@ -1968,16 +1970,25 @@ def evaluate_logit_average(ensemble_models: list[nn.Module], schedule_cfg: Forwa
     for _ in range(val_steps):
         inputs, targets, cum_seqlens, bigram_inputs, _ = next(val_loader)
         avg_logits = None
-        for model in ensemble_models:
+        for path in ckpt_paths:
+            model_io.load_state_dict(load_model_state_cpu(path))
             logits = model(inputs, targets, cum_seqlens, bigram_inputs, schedule_cfg, return_logits=True)
             avg_logits = logits if avg_logits is None else avg_logits.add_(logits)
-        avg_logits.mul_(1 / len(ensemble_models))
-        loss_per_token = F.cross_entropy(
-            avg_logits.float().view(-1, avg_logits.size(-1)),
-            targets,
-            reduction="none",
-        )
-        val_loss += loss_per_token.mean()
+            del logits
+        avg_logits.mul_(1 / len(ckpt_paths))
+        logits_2d = avg_logits.view(-1, avg_logits.size(-1))
+        del avg_logits
+        # Chunk the float32 cross-entropy to avoid OOM from full cast
+        chunk_size = 4096
+        total_loss = torch.zeros(1, device=logits_2d.device)
+        n = logits_2d.size(0)
+        for start in range(0, n, chunk_size):
+            end = min(start + chunk_size, n)
+            total_loss += F.cross_entropy(
+                logits_2d[start:end].float(), targets[start:end], reduction="none"
+            ).sum()
+        val_loss += total_loss / n
+        del logits_2d
     val_loss /= val_steps
     dist.reduce(val_loss, 0, op=dist.ReduceOp.AVG)
     return float(val_loss) if master_process else None
@@ -1989,36 +2000,31 @@ def run_posthoc_evals(model: nn.Module, ckpt_paths: list[Path], schedule_cfg: Fo
     print0("=" * 100, console=True)
     print0(f"Running posthoc checkpoint evals for saved steps {ckpt_steps}", console=True)
 
-    for count in args.posthoc_weight_avg_counts:
-        if count > len(ckpt_paths):
-            continue
-        paths = ckpt_paths[-count:]
-        avg_state = average_model_states(paths)
-        model_io.load_state_dict(avg_state)
-        val_loss = evaluate_val_loss(model, schedule_cfg)
-        if master_process:
-            print0(f"posthoc weight_avg_last{count} val_loss:{val_loss:.4f} steps:{ckpt_steps[-count:]}", console=True)
+    # for count in args.posthoc_weight_avg_counts:
+    #     if count > len(ckpt_paths):
+    #         continue
+    #     paths = ckpt_paths[-count:]
+    #     avg_state = average_model_states(paths)
+    #     model_io.load_state_dict(avg_state)
+    #     val_loss = evaluate_val_loss(model, schedule_cfg)
+    #     if master_process:
+    #         print0(f"posthoc weight_avg_last{count} val_loss:{val_loss:.4f} steps:{ckpt_steps[-count:]}", console=True)
 
-    for half_life in args.posthoc_ema_half_lives:
-        weights = ema_weights_from_steps(ckpt_steps, half_life)
-        ema_state = average_model_states(ckpt_paths, weights)
-        model_io.load_state_dict(ema_state)
-        val_loss = evaluate_val_loss(model, schedule_cfg)
-        if master_process:
-            print0(f"posthoc ema_half_life_{half_life} val_loss:{val_loss:.4f}", console=True)
+    # for half_life in args.posthoc_ema_half_lives:
+    #     weights = ema_weights_from_steps(ckpt_steps, half_life)
+    #     ema_state = average_model_states(ckpt_paths, weights)
+    #     model_io.load_state_dict(ema_state)
+    #     val_loss = evaluate_val_loss(model, schedule_cfg)
+    #     if master_process:
+    #         print0(f"posthoc ema_half_life_{half_life} val_loss:{val_loss:.4f}", console=True)
 
     for count in args.posthoc_logit_avg_counts:
         if count > len(ckpt_paths):
             continue
         paths = ckpt_paths[-count:]
-        ensemble_models = [build_eval_model() for _ in paths]
-        for ensemble_model, path in zip(ensemble_models, paths):
-            ensemble_model.load_state_dict(load_model_state_cpu(path))
-        val_loss = evaluate_logit_average(ensemble_models, schedule_cfg)
+        val_loss = evaluate_logit_average(model, paths, schedule_cfg)
         if master_process:
             print0(f"posthoc logit_avg_last{count} val_loss:{val_loss:.4f} steps:{ckpt_steps[-count:]}", console=True)
-        del ensemble_models
-        torch.cuda.empty_cache()
 
     print0("=" * 100, console=True)
 
@@ -2026,11 +2032,15 @@ def run_posthoc_evals(model: nn.Module, ckpt_paths: list[Path], schedule_cfg: Fo
 # int main
 
 # begin logging
+run_id_holder = [args.run_id if master_process else None]
+dist.broadcast_object_list(run_id_holder, src=0)
+run_id = run_id_holder[0]
+args.run_id = run_id
+
 logfile = None
 if master_process:
-    run_id = args.run_id
     os.makedirs("logs_save", exist_ok=True)
-    logfile = f"logs_save/{run_id}.txt"
+    logfile = f"logs_save/{run_id}{'.eval_only' if args.eval_only_run_id else ''}.txt"
     print(logfile)
 def print0(s, console=False):
     if master_process:
@@ -2075,6 +2085,43 @@ for param in model.parameters():
 model: nn.Module = torch.compile(model, dynamic=False, fullgraph=True)
 model_io = get_model_io(model)
 training_manager = TrainingManager(model)
+
+train_steps = training_schedule.total_steps
+run_dir = Path("logs_save") / run_id
+late_ckpt_paths = late_checkpoint_paths_for_run(run_id, train_steps)
+
+if args.eval_only_run_id is not None:
+    missing = [str(path) for path in late_ckpt_paths if not path.exists()]
+    if missing:
+        raise FileNotFoundError(
+            "Missing late checkpoints for eval-only run "
+            f"{run_id}. Missing files: {missing[:3]}{' ...' if len(missing) > 3 else ''}"
+        )
+    # Free optimizer GPU state — only need the schedule for eval
+    for p_state in training_manager.optimizer.param_states.values():
+        for v in p_state.values():
+            if isinstance(v, torch.Tensor) and v.is_cuda:
+                v.data = torch.empty(0, device="cpu")
+    torch.cuda.empty_cache()
+    gc.collect()
+
+    print0(f"Eval-only mode for run_id={run_id}", console=True)
+    print0(f"Using late checkpoints {[path.name for path in late_ckpt_paths]}", console=True)
+    advance_to_final_eval_schedule(training_manager, train_steps)
+    # Warmup compiled model with one eval batch
+    print0("Warming up compiled model...", console=True)
+    val_loader_warmup = distributed_data_generator(args.val_files, args.val_batch_size, -1, grad_accum_steps=grad_accum_steps, align_to_bos=False)
+    model.eval()
+    with torch.no_grad():
+        inputs, targets, cum_seqlens, bigram_inputs, _ = next(val_loader_warmup)
+        model(inputs, targets, cum_seqlens, bigram_inputs, training_manager.get_forward_args()).mean()
+    del val_loader_warmup
+    print0("Warmup done, running posthoc evals...", console=True)
+    run_posthoc_evals(model, late_ckpt_paths, training_manager.get_forward_args(), print0)
+    print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
+           f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True)
+    dist.destroy_process_group()
+    sys.exit(0)
 
 
 ########################################
@@ -2126,11 +2173,8 @@ training_time_ms = 0
 torch.cuda.synchronize()
 t0 = time.perf_counter()
 # begin training
-train_steps = training_schedule.total_steps
 late_save_steps = late_checkpoint_step_indices(train_steps, args.late_checkpoint_window, args.late_checkpoint_stride)
 late_save_step_set = set(late_save_steps)
-run_dir = Path("logs_save") / args.run_id
-late_ckpt_paths = [late_checkpoint_path(run_dir, step) for step in late_save_steps]
 if master_process:
     print0(f"Saving late model checkpoints at steps {[step + 1 for step in late_save_steps]}", console=True)
 for step in range(train_steps + 1):
