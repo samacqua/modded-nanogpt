@@ -1259,7 +1259,8 @@ class GPT(nn.Module):
         for name, param in self.named_parameters():
             param.label = name.replace('.weight', '')
 
-    def forward(self, input_seq: Tensor, target_seq: Tensor, seqlens: Tensor, bigram_input_seq: Tensor, schedule_cfg: ForwardScheduleConfig):
+    def forward(self, input_seq: Tensor, target_seq: Tensor, seqlens: Tensor, bigram_input_seq: Tensor,
+                schedule_cfg: ForwardScheduleConfig, return_logits: bool = False):
         assert input_seq.ndim == 1
 
         # ---- Schedule and layer topology ----
@@ -1366,6 +1367,8 @@ class GPT(nn.Module):
         else:
             logits = self.lm_head(x)
             logits = 23 * torch.sigmoid((logits + 5) / 7.5)
+            if return_logits:
+                return logits
             logits_for_loss = logits.float()
             loss_per_token = F.cross_entropy(logits_for_loss.view(-1, logits_for_loss.size(-1)), target_seq, reduction="none")
         return loss_per_token
@@ -1572,6 +1575,12 @@ class Hyperparameters:
     val_loss_every: int = 250  # every how many steps to evaluate val loss? 0 for only at the end
     save_checkpoint: bool = False
     run_evals: bool = False  # run additional evaluations after training is completed
+    late_checkpoint_window: int = 30
+    late_checkpoint_stride: int = 2
+    run_posthoc_averaging: bool = True
+    posthoc_weight_avg_counts: tuple[int, ...] = (3, 5, 7)
+    posthoc_ema_half_lives: tuple[int, ...] = (4, 8, 16)
+    posthoc_logit_avg_counts: tuple[int, ...] = (3, 5)
     # bigram hash embedding
     bigram_vocab_size: int = 50304 * 5
 
@@ -1855,14 +1864,173 @@ class TrainingManager():
         
 
 # -----------------------------------------------------------------------------
+# Posthoc checkpoint saving / evaluation helpers
+
+def get_model_io(model: nn.Module) -> nn.Module:
+    return model._orig_mod if hasattr(model, "_orig_mod") else model
+
+def copy_model_state_cpu(model: nn.Module) -> dict[str, torch.Tensor]:
+    return {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+
+def late_checkpoint_step_indices(train_steps: int, window: int, stride: int) -> list[int]:
+    assert stride > 0
+    last_train_step = train_steps - 1
+    start = max(0, train_steps - window)
+    parity = last_train_step % stride
+    return [step for step in range(start, last_train_step + 1) if step % stride == parity]
+
+def late_checkpoint_path(run_dir: Path, step: int) -> Path:
+    return run_dir / "late_models" / f"model_step{step + 1:06d}.pt"
+
+def save_late_model_checkpoint(model: nn.Module, path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(copy_model_state_cpu(model), path)
+
+def load_model_state_cpu(path: Path) -> dict[str, torch.Tensor]:
+    return torch.load(path, map_location="cpu")
+
+def average_model_states(paths: list[Path], weights: list[float] | None = None) -> dict[str, torch.Tensor]:
+    assert paths
+    if weights is None:
+        weights = [1.0] * len(paths)
+    assert len(paths) == len(weights)
+    total = sum(weights)
+    weights = [w / total for w in weights]
+
+    avg_state = None
+    dtypes = {}
+    for path, weight in zip(paths, weights):
+        state = load_model_state_cpu(path)
+        if avg_state is None:
+            avg_state = {}
+            for key, value in state.items():
+                dtypes[key] = value.dtype
+                if torch.is_floating_point(value):
+                    avg_state[key] = value.float().mul_(weight)
+                else:
+                    avg_state[key] = value.clone()
+        else:
+            for key, value in state.items():
+                if torch.is_floating_point(value):
+                    avg_state[key].add_(value.float(), alpha=weight)
+        del state
+
+    for key, value in avg_state.items():
+        if torch.is_floating_point(value):
+            avg_state[key] = value.to(dtype=dtypes[key])
+    return avg_state
+
+def ema_weights_from_steps(steps: list[int], half_life: int) -> list[float]:
+    last_step = steps[-1]
+    return [math.exp(-math.log(2) * (last_step - step) / half_life) for step in steps]
+
+@torch.no_grad()
+def evaluate_val_loss(eval_model: nn.Module, schedule_cfg: ForwardScheduleConfig):
+    eval_model.eval()
+    assert args.val_tokens % args.val_batch_size == 0
+    val_steps = grad_accum_steps * args.val_tokens // args.val_batch_size
+    val_loader = distributed_data_generator(args.val_files, args.val_batch_size, -1, grad_accum_steps=grad_accum_steps, align_to_bos=False)
+    val_loss = 0
+    for _ in range(val_steps):
+        inputs, targets, cum_seqlens, bigram_inputs, _ = next(val_loader)
+        val_loss += eval_model(inputs, targets, cum_seqlens, bigram_inputs, schedule_cfg).mean()
+    val_loss /= val_steps
+    dist.reduce(val_loss, 0, op=dist.ReduceOp.AVG)
+    return float(val_loss) if master_process else None
+
+def build_eval_model() -> nn.Module:
+    eval_model = GPT(
+        vocab_size=50257,
+        num_layers=11,
+        num_heads=6,
+        head_dim=128,
+        model_dim=768,
+        max_seq_len=args.val_batch_size // (grad_accum_steps * world_size)
+    ).cuda()
+    for m in eval_model.modules():
+        if isinstance(m, (nn.Embedding, nn.Linear)):
+            m.weight.data = m.weight.data.bfloat16()
+    eval_model.attn_gate_bank.data = eval_model.attn_gate_bank.data.bfloat16()
+    eval_model.ve_gate_bank.data = eval_model.ve_gate_bank.data.bfloat16()
+    eval_model.qk_bank.data = eval_model.qk_bank.data.bfloat16()
+    eval_model.vo_bank.data = eval_model.vo_bank.data.bfloat16()
+    eval_model.mlp_bank.data = eval_model.mlp_bank.data.bfloat16()
+    return eval_model.eval()
+
+@torch.no_grad()
+def evaluate_logit_average(ensemble_models: list[nn.Module], schedule_cfg: ForwardScheduleConfig):
+    for model in ensemble_models:
+        model.eval()
+    assert args.val_tokens % args.val_batch_size == 0
+    val_steps = grad_accum_steps * args.val_tokens // args.val_batch_size
+    val_loader = distributed_data_generator(args.val_files, args.val_batch_size, -1, grad_accum_steps=grad_accum_steps, align_to_bos=False)
+    val_loss = 0
+    for _ in range(val_steps):
+        inputs, targets, cum_seqlens, bigram_inputs, _ = next(val_loader)
+        avg_logits = None
+        for model in ensemble_models:
+            logits = model(inputs, targets, cum_seqlens, bigram_inputs, schedule_cfg, return_logits=True)
+            avg_logits = logits if avg_logits is None else avg_logits.add_(logits)
+        avg_logits.mul_(1 / len(ensemble_models))
+        loss_per_token = F.cross_entropy(
+            avg_logits.float().view(-1, avg_logits.size(-1)),
+            targets,
+            reduction="none",
+        )
+        val_loss += loss_per_token.mean()
+    val_loss /= val_steps
+    dist.reduce(val_loss, 0, op=dist.ReduceOp.AVG)
+    return float(val_loss) if master_process else None
+
+def run_posthoc_evals(model: nn.Module, ckpt_paths: list[Path], schedule_cfg: ForwardScheduleConfig, print0):
+    model_io = get_model_io(model)
+    ckpt_steps = [int(path.stem.split("step")[1]) for path in ckpt_paths]
+
+    print0("=" * 100, console=True)
+    print0(f"Running posthoc checkpoint evals for saved steps {ckpt_steps}", console=True)
+
+    for count in args.posthoc_weight_avg_counts:
+        if count > len(ckpt_paths):
+            continue
+        paths = ckpt_paths[-count:]
+        avg_state = average_model_states(paths)
+        model_io.load_state_dict(avg_state)
+        val_loss = evaluate_val_loss(model, schedule_cfg)
+        if master_process:
+            print0(f"posthoc weight_avg_last{count} val_loss:{val_loss:.4f} steps:{ckpt_steps[-count:]}", console=True)
+
+    for half_life in args.posthoc_ema_half_lives:
+        weights = ema_weights_from_steps(ckpt_steps, half_life)
+        ema_state = average_model_states(ckpt_paths, weights)
+        model_io.load_state_dict(ema_state)
+        val_loss = evaluate_val_loss(model, schedule_cfg)
+        if master_process:
+            print0(f"posthoc ema_half_life_{half_life} val_loss:{val_loss:.4f}", console=True)
+
+    for count in args.posthoc_logit_avg_counts:
+        if count > len(ckpt_paths):
+            continue
+        paths = ckpt_paths[-count:]
+        ensemble_models = [build_eval_model() for _ in paths]
+        for ensemble_model, path in zip(ensemble_models, paths):
+            ensemble_model.load_state_dict(load_model_state_cpu(path))
+        val_loss = evaluate_logit_average(ensemble_models, schedule_cfg)
+        if master_process:
+            print0(f"posthoc logit_avg_last{count} val_loss:{val_loss:.4f} steps:{ckpt_steps[-count:]}", console=True)
+        del ensemble_models
+        torch.cuda.empty_cache()
+
+    print0("=" * 100, console=True)
+
+# -----------------------------------------------------------------------------
 # int main
 
 # begin logging
 logfile = None
 if master_process:
     run_id = args.run_id
-    os.makedirs("logs_og", exist_ok=True)
-    logfile = f"logs_og/{run_id}.txt"
+    os.makedirs("logs_save", exist_ok=True)
+    logfile = f"logs_save/{run_id}.txt"
     print(logfile)
 def print0(s, console=False):
     if master_process:
@@ -1905,6 +2073,7 @@ for param in model.parameters():
     dist.broadcast(param.detach(), 0)
 
 model: nn.Module = torch.compile(model, dynamic=False, fullgraph=True)
+model_io = get_model_io(model)
 training_manager = TrainingManager(model)
 
 
@@ -1958,6 +2127,12 @@ torch.cuda.synchronize()
 t0 = time.perf_counter()
 # begin training
 train_steps = training_schedule.total_steps
+late_save_steps = late_checkpoint_step_indices(train_steps, args.late_checkpoint_window, args.late_checkpoint_stride)
+late_save_step_set = set(late_save_steps)
+run_dir = Path("logs_save") / args.run_id
+late_ckpt_paths = [late_checkpoint_path(run_dir, step) for step in late_save_steps]
+if master_process:
+    print0(f"Saving late model checkpoints at steps {[step + 1 for step in late_save_steps]}", console=True)
 for step in range(train_steps + 1):
     last_step = (step == train_steps)
     training_manager.advance_schedule(step)
@@ -1987,10 +2162,14 @@ for step in range(train_steps + 1):
         t0 = time.perf_counter()
 
     if last_step:
+        if args.run_posthoc_averaging:
+            dist.barrier()
+            run_posthoc_evals(model, late_ckpt_paths, training_manager.get_forward_args(), print0)
+            model_io.load_state_dict(load_model_state_cpu(late_ckpt_paths[-1]))
         if master_process and args.save_checkpoint:
             log = dict(step=step, code=code, model=model.state_dict(), optimizer=training_manager.get_state())
-            os.makedirs(f"logs_og/{run_id}", exist_ok=True)
-            torch.save(log, f"logs_og/{run_id}/state_step{step:06d}.pt")
+            os.makedirs(f"logs_save/{run_id}", exist_ok=True)
+            torch.save(log, f"logs_save/{run_id}/state_step{step:06d}.pt")
         # the last step only has the validation loop, so break to avoid training
         break
 
@@ -2003,6 +2182,12 @@ for step in range(train_steps + 1):
         loss.backward()
         del loss
     training_manager.step_optimizers(step)
+    if step in late_save_step_set:
+        if master_process:
+            ckpt_path = late_checkpoint_path(run_dir, step)
+            save_late_model_checkpoint(model_io, ckpt_path)
+            print0(f"saved late model checkpoint: {ckpt_path.name}", console=True)
+        dist.barrier()
 
     # logging
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)

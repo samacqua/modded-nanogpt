@@ -1181,14 +1181,13 @@ class GPT(nn.Module):
         hdim = num_heads * head_dim
         mlp_hdim = 4 * model_dim
 
-        # QK bank: per-head-pair Muon groups for Q, K weights
-        # Each pair of adjacent heads gets its own independent polar express orthogonalization
+        # QK bank: per-single-head Muon groups for Q, K weights
         self._num_attn_layers = num_attn_layers
-        num_qk_groups = num_attn_layers * 2 * (num_heads // 2)  # 10 * 2 * 3 = 60
+        num_qk_groups = num_attn_layers * 2 * num_heads  # 10 * 2 * 6 = 120
         self._num_qk_groups = num_qk_groups
-        num_qk_padded = next_multiple_of_n(num_qk_groups, n=world_size)  # 64
-        self.qk_bank = nn.Parameter(torch.empty(num_qk_padded, head_dim * 2, model_dim))
-        self.qk_bank.reshape = (num_qk_padded, head_dim * 2, model_dim)
+        num_qk_padded = next_multiple_of_n(num_qk_groups, n=world_size)  # 120
+        self.qk_bank = nn.Parameter(torch.empty(num_qk_padded, head_dim, model_dim))
+        self.qk_bank.reshape = (num_qk_padded, head_dim, model_dim)
 
         # VO bank: per-layer Muon groups for V and O weights
         num_vo_real = num_attn_layers * 2  # 20
@@ -1861,8 +1860,8 @@ class TrainingManager():
 logfile = None
 if master_process:
     run_id = args.run_id
-    os.makedirs("logs_og", exist_ok=True)
-    logfile = f"logs_og/{run_id}.txt"
+    os.makedirs("logs7", exist_ok=True)
+    logfile = f"logs7/{run_id}.txt"
     print(logfile)
 def print0(s, console=False):
     if master_process:
@@ -1989,8 +1988,8 @@ for step in range(train_steps + 1):
     if last_step:
         if master_process and args.save_checkpoint:
             log = dict(step=step, code=code, model=model.state_dict(), optimizer=training_manager.get_state())
-            os.makedirs(f"logs_og/{run_id}", exist_ok=True)
-            torch.save(log, f"logs_og/{run_id}/state_step{step:06d}.pt")
+            os.makedirs(f"logs7/{run_id}", exist_ok=True)
+            torch.save(log, f"logs7/{run_id}/state_step{step:06d}.pt")
         # the last step only has the validation loop, so break to avoid training
         break
 

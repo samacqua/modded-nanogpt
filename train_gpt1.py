@@ -1181,14 +1181,34 @@ class GPT(nn.Module):
         hdim = num_heads * head_dim
         mlp_hdim = 4 * model_dim
 
-        # QK bank: per-head-pair Muon groups for Q, K weights
-        # Each pair of adjacent heads gets its own independent polar express orthogonalization
+        # Determine paired vs non-paired attention layer indices
+        # attn_idx = model_layer - (model_layer > 6), skipping layer 6 (no attention)
         self._num_attn_layers = num_attn_layers
-        num_qk_groups = num_attn_layers * 2 * (num_heads // 2)  # 10 * 2 * 3 = 60
-        self._num_qk_groups = num_qk_groups
-        num_qk_padded = next_multiple_of_n(num_qk_groups, n=world_size)  # 64
-        self.qk_bank = nn.Parameter(torch.empty(num_qk_padded, head_dim * 2, model_dim))
-        self.qk_bank.reshape = (num_qk_padded, head_dim * 2, model_dim)
+        paired_head_set = {0, 2, 5, 9}
+        self._paired_attn_indices = []
+        self._non_paired_attn_indices = []
+        for ml in range(num_layers):
+            if ml == 6:
+                continue
+            ai = ml - (ml > 6)
+            (self._paired_attn_indices if ml in paired_head_set else self._non_paired_attn_indices).append(ai)
+        num_paired_attn = len(self._paired_attn_indices)    # 4
+        num_non_paired_attn = len(self._non_paired_attn_indices)  # 6
+        self._paired_attn_set = set(self._paired_attn_indices)
+
+        # QK bank for paired layers: per-head-pair Muon groups
+        num_qk_paired_groups = num_paired_attn * 2 * (num_heads // 2)  # 4 * 2 * 3 = 24
+        self._num_qk_paired_groups = num_qk_paired_groups
+        num_qk_paired_padded = next_multiple_of_n(num_qk_paired_groups, n=world_size)  # 24
+        self.qk_bank_paired = nn.Parameter(torch.empty(num_qk_paired_padded, head_dim * 2, model_dim))
+        self.qk_bank_paired.reshape = (num_qk_paired_padded, head_dim * 2, model_dim)
+
+        # QK bank for non-paired layers: per-layer Muon groups (full Q or K as one group)
+        num_qk_full_groups = num_non_paired_attn * 2  # 6 * 2 = 12
+        self._num_qk_full_groups = num_qk_full_groups
+        num_qk_full_padded = next_multiple_of_n(num_qk_full_groups, n=world_size)  # 16
+        self.qk_bank_full = nn.Parameter(torch.empty(num_qk_full_padded, hdim, model_dim))
+        self.qk_bank_full.reshape = (num_qk_full_padded, hdim, model_dim)
 
         # VO bank: per-layer Muon groups for V and O weights
         num_vo_real = num_attn_layers * 2  # 20
@@ -1205,8 +1225,10 @@ class GPT(nn.Module):
         std = 0.5 * model_dim ** -0.5
         bound = (3 ** 0.5) * std
         with torch.no_grad():
-            self.qk_bank[:num_qk_groups].uniform_(-bound, bound)
-            self.qk_bank[num_qk_groups:].zero_()
+            self.qk_bank_paired[:num_qk_paired_groups].uniform_(-bound, bound)
+            self.qk_bank_paired[num_qk_paired_groups:].zero_()
+            self.qk_bank_full[:num_qk_full_groups].uniform_(-bound, bound)
+            self.qk_bank_full[num_qk_full_groups:].zero_()
             self.vo_bank[:num_vo_real].uniform_(-bound, bound)
             self.vo_bank[num_vo_real:].zero_()
             self.mlp_bank[:, 0, :, :].uniform_(-bound, bound)  # c_fc
@@ -1287,7 +1309,21 @@ class GPT(nn.Module):
         ve_gates = [None, veg[0], veg[1], *self.gate_filler_nones, veg[2], veg[3], veg[4]]
         assert len(attn_gates) == self.num_layers
         assert len(ve_gates) == self.num_layers
-        qk_all = self.qk_bank[:self._num_qk_groups].view(self._num_attn_layers, -1, self.qk_bank.shape[-1])
+        # Reconstruct per-layer QK weights from the two banks
+        paired_qk = self.qk_bank_paired[:self._num_qk_paired_groups].view(
+            len(self._paired_attn_indices), -1, self.qk_bank_paired.shape[-1])
+        full_qk = self.qk_bank_full[:self._num_qk_full_groups].view(
+            len(self._non_paired_attn_indices), -1, self.qk_bank_full.shape[-1])
+        qk_layers = [None] * self._num_attn_layers
+        pi, fi = 0, 0
+        for ai in range(self._num_attn_layers):
+            if ai in self._paired_attn_set:
+                qk_layers[ai] = paired_qk[pi]
+                pi += 1
+            else:
+                qk_layers[ai] = full_qk[fi]
+                fi += 1
+        qk_all = torch.stack(qk_layers)
         vo_flat = self.vo_bank[:self._num_attn_layers * 2].view(self._num_attn_layers, 2, *self.vo_bank.shape[1:]).flatten(1, 2)
         attn_weights = torch.cat([qk_all, vo_flat], dim=1).unbind(0)
         mlp_all = self.mlp_bank.flatten(0, 1).unbind(0)  # 24 tensors of [mlp_hdim, dim]
@@ -1691,7 +1727,8 @@ class TrainingManager():
         # - "sharded" parameters use reduce_scatter/all_gather and "replicated" ones use all_reduce
         # - lr_mul and wd_mul are per-parameter learning rate and weight decay multipliers
         self.param_table = {
-            "qk_bank":        {"optim": "normuon", "comms": "sharded",    "adam_betas": None},
+            "qk_bank_paired": {"optim": "normuon", "comms": "sharded",    "adam_betas": None},
+            "qk_bank_full":   {"optim": "normuon", "comms": "sharded",    "adam_betas": None},
             "vo_bank":        {"optim": "normuon", "comms": "sharded",    "adam_betas": None},
             "mlp_bank":       {"optim": "normuon", "comms": "sharded",    "adam_betas": None},
             "scalars":        {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 5.0,  "wd_mul": 0.0},
@@ -1715,7 +1752,7 @@ class TrainingManager():
             "scalars", "smear_gate", "skip_gate", "attn_gate_bank", "ve_gate_bank", "post_lambdas", "x0_lambdas", "bigram_lambdas", "resid_lambdas",  # Small, fast
             "value_embeds", "bigram_embed",  # Medium
             "lm_head", "embed",   # lm_head must complete before embed sync (when tied)
-            "qk_bank", "vo_bank", "mlp_bank",  # Large, polar express - process last to maximize overlap
+            "qk_bank_paired", "qk_bank_full", "vo_bank", "mlp_bank",  # Large, polar express - process last to maximize overlap
         ]
 
         adam_defaults = dict(
@@ -1861,8 +1898,8 @@ class TrainingManager():
 logfile = None
 if master_process:
     run_id = args.run_id
-    os.makedirs("logs_og", exist_ok=True)
-    logfile = f"logs_og/{run_id}.txt"
+    os.makedirs("logs1", exist_ok=True)
+    logfile = f"logs1/{run_id}.txt"
     print(logfile)
 def print0(s, console=False):
     if master_process:
@@ -1898,7 +1935,8 @@ for m in model.modules():
         m.weight.data = m.weight.data.bfloat16()
 model.attn_gate_bank.data = model.attn_gate_bank.data.bfloat16()
 model.ve_gate_bank.data = model.ve_gate_bank.data.bfloat16()
-model.qk_bank.data = model.qk_bank.data.bfloat16()
+model.qk_bank_paired.data = model.qk_bank_paired.data.bfloat16()
+model.qk_bank_full.data = model.qk_bank_full.data.bfloat16()
 model.vo_bank.data = model.vo_bank.data.bfloat16()
 model.mlp_bank.data = model.mlp_bank.data.bfloat16()
 for param in model.parameters():
@@ -1989,8 +2027,8 @@ for step in range(train_steps + 1):
     if last_step:
         if master_process and args.save_checkpoint:
             log = dict(step=step, code=code, model=model.state_dict(), optimizer=training_manager.get_state())
-            os.makedirs(f"logs_og/{run_id}", exist_ok=True)
-            torch.save(log, f"logs_og/{run_id}/state_step{step:06d}.pt")
+            os.makedirs(f"logs1/{run_id}", exist_ok=True)
+            torch.save(log, f"logs1/{run_id}/state_step{step:06d}.pt")
         # the last step only has the validation loop, so break to avoid training
         break
 

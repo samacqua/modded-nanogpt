@@ -1190,11 +1190,19 @@ class GPT(nn.Module):
         self.qk_bank = nn.Parameter(torch.empty(num_qk_padded, head_dim * 2, model_dim))
         self.qk_bank.reshape = (num_qk_padded, head_dim * 2, model_dim)
 
-        # VO bank: per-layer Muon groups for V and O weights
-        num_vo_real = num_attn_layers * 2  # 20
-        num_vo_padded = next_multiple_of_n(num_vo_real, n=world_size)  # 24
-        self.vo_bank = nn.Parameter(torch.empty(num_vo_padded, hdim, hdim))
-        self.vo_bank.reshape = (num_vo_padded, hdim, hdim)
+        # V bank: per-head-pair Muon groups for V weights (like QK bank)
+        num_v_groups = num_attn_layers * (num_heads // 2)  # 10 * 3 = 30
+        self._num_v_groups = num_v_groups
+        num_v_padded = next_multiple_of_n(num_v_groups, n=world_size)  # 32
+        self.v_bank = nn.Parameter(torch.empty(num_v_padded, head_dim * 2, model_dim))
+        self.v_bank.reshape = (num_v_padded, head_dim * 2, model_dim)
+
+        # O bank: per-layer Muon groups for O weights
+        num_o_real = num_attn_layers  # 10
+        self._num_o_groups = num_o_real
+        num_o_padded = next_multiple_of_n(num_o_real, n=world_size)  # 16
+        self.o_bank = nn.Parameter(torch.empty(num_o_padded, hdim, hdim))
+        self.o_bank.reshape = (num_o_padded, hdim, hdim)
 
         # MLP bank: stores c_fc and c_proj for all MLP layers
         # We add 1 padding layer (index 11) to get 12*2=24 matrices for even distribution across 8 GPUs
@@ -1207,8 +1215,10 @@ class GPT(nn.Module):
         with torch.no_grad():
             self.qk_bank[:num_qk_groups].uniform_(-bound, bound)
             self.qk_bank[num_qk_groups:].zero_()
-            self.vo_bank[:num_vo_real].uniform_(-bound, bound)
-            self.vo_bank[num_vo_real:].zero_()
+            self.v_bank[:num_v_groups].uniform_(-bound, bound)
+            self.v_bank[num_v_groups:].zero_()
+            self.o_bank[:num_o_real].uniform_(-bound, bound)
+            self.o_bank[num_o_real:].zero_()
             self.mlp_bank[:, 0, :, :].uniform_(-bound, bound)  # c_fc
             self.mlp_bank[:, 1, :, :].zero_()  # c_proj - zero init suggested by @Grad62304977
 
@@ -1288,7 +1298,9 @@ class GPT(nn.Module):
         assert len(attn_gates) == self.num_layers
         assert len(ve_gates) == self.num_layers
         qk_all = self.qk_bank[:self._num_qk_groups].view(self._num_attn_layers, -1, self.qk_bank.shape[-1])
-        vo_flat = self.vo_bank[:self._num_attn_layers * 2].view(self._num_attn_layers, 2, *self.vo_bank.shape[1:]).flatten(1, 2)
+        v_all = self.v_bank[:self._num_v_groups].view(self._num_attn_layers, -1, self.v_bank.shape[-1])
+        o_all = self.o_bank[:self._num_o_groups]  # (10, 768, 768)
+        vo_flat = torch.cat([v_all, o_all], dim=1)
         attn_weights = torch.cat([qk_all, vo_flat], dim=1).unbind(0)
         mlp_all = self.mlp_bank.flatten(0, 1).unbind(0)  # 24 tensors of [mlp_hdim, dim]
         mlp_fcs = mlp_all[0::2]    # even indices: c_fc
@@ -1692,7 +1704,8 @@ class TrainingManager():
         # - lr_mul and wd_mul are per-parameter learning rate and weight decay multipliers
         self.param_table = {
             "qk_bank":        {"optim": "normuon", "comms": "sharded",    "adam_betas": None},
-            "vo_bank":        {"optim": "normuon", "comms": "sharded",    "adam_betas": None},
+            "v_bank":         {"optim": "normuon", "comms": "sharded",    "adam_betas": None},
+            "o_bank":         {"optim": "normuon", "comms": "sharded",    "adam_betas": None},
             "mlp_bank":       {"optim": "normuon", "comms": "sharded",    "adam_betas": None},
             "scalars":        {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 5.0,  "wd_mul": 0.0},
             "smear_gate":     {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 0.01, "wd_mul": 0.0},
@@ -1715,7 +1728,7 @@ class TrainingManager():
             "scalars", "smear_gate", "skip_gate", "attn_gate_bank", "ve_gate_bank", "post_lambdas", "x0_lambdas", "bigram_lambdas", "resid_lambdas",  # Small, fast
             "value_embeds", "bigram_embed",  # Medium
             "lm_head", "embed",   # lm_head must complete before embed sync (when tied)
-            "qk_bank", "vo_bank", "mlp_bank",  # Large, polar express - process last to maximize overlap
+            "qk_bank", "v_bank", "o_bank", "mlp_bank",  # Large, polar express - process last to maximize overlap
         ]
 
         adam_defaults = dict(
@@ -1861,8 +1874,8 @@ class TrainingManager():
 logfile = None
 if master_process:
     run_id = args.run_id
-    os.makedirs("logs_og", exist_ok=True)
-    logfile = f"logs_og/{run_id}.txt"
+    os.makedirs("logs4", exist_ok=True)
+    logfile = f"logs4/{run_id}.txt"
     print(logfile)
 def print0(s, console=False):
     if master_process:
@@ -1899,7 +1912,8 @@ for m in model.modules():
 model.attn_gate_bank.data = model.attn_gate_bank.data.bfloat16()
 model.ve_gate_bank.data = model.ve_gate_bank.data.bfloat16()
 model.qk_bank.data = model.qk_bank.data.bfloat16()
-model.vo_bank.data = model.vo_bank.data.bfloat16()
+model.v_bank.data = model.v_bank.data.bfloat16()
+model.o_bank.data = model.o_bank.data.bfloat16()
 model.mlp_bank.data = model.mlp_bank.data.bfloat16()
 for param in model.parameters():
     dist.broadcast(param.detach(), 0)
@@ -1989,8 +2003,8 @@ for step in range(train_steps + 1):
     if last_step:
         if master_process and args.save_checkpoint:
             log = dict(step=step, code=code, model=model.state_dict(), optimizer=training_manager.get_state())
-            os.makedirs(f"logs_og/{run_id}", exist_ok=True)
-            torch.save(log, f"logs_og/{run_id}/state_step{step:06d}.pt")
+            os.makedirs(f"logs4/{run_id}", exist_ok=True)
+            torch.save(log, f"logs4/{run_id}/state_step{step:06d}.pt")
         # the last step only has the validation loop, so break to avoid training
         break
 

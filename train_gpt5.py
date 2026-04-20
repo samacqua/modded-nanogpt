@@ -1181,14 +1181,18 @@ class GPT(nn.Module):
         hdim = num_heads * head_dim
         mlp_hdim = 4 * model_dim
 
-        # QK bank: per-head-pair Muon groups for Q, K weights
-        # Each pair of adjacent heads gets its own independent polar express orthogonalization
+        # QK bank: per-head-triple Muon groups for Q, K weights (groups of 3 heads)
         self._num_attn_layers = num_attn_layers
-        num_qk_groups = num_attn_layers * 2 * (num_heads // 2)  # 10 * 2 * 3 = 60
+        heads_per_group = 3
+        groups_per_qk = math.ceil(num_heads / heads_per_group)  # ceil(6/4) = 2
+        group_width = heads_per_group * head_dim  # 4 * 128 = 512
+        self._groups_per_qk = groups_per_qk
+        self._group_width = group_width
+        num_qk_groups = num_attn_layers * 2 * groups_per_qk  # 10 * 2 * 2 = 40
         self._num_qk_groups = num_qk_groups
-        num_qk_padded = next_multiple_of_n(num_qk_groups, n=world_size)  # 64
-        self.qk_bank = nn.Parameter(torch.empty(num_qk_padded, head_dim * 2, model_dim))
-        self.qk_bank.reshape = (num_qk_padded, head_dim * 2, model_dim)
+        num_qk_padded = next_multiple_of_n(num_qk_groups, n=world_size)  # 40
+        self.qk_bank = nn.Parameter(torch.empty(num_qk_padded, group_width, model_dim))
+        self.qk_bank.reshape = (num_qk_padded, group_width, model_dim)
 
         # VO bank: per-layer Muon groups for V and O weights
         num_vo_real = num_attn_layers * 2  # 20
@@ -1206,6 +1210,13 @@ class GPT(nn.Module):
         bound = (3 ** 0.5) * std
         with torch.no_grad():
             self.qk_bank[:num_qk_groups].uniform_(-bound, bound)
+            # Zero padding rows within the last group of each Q/K (heads 4-5 real, 6-7 pad)
+            remaining_heads = num_heads % heads_per_group  # 6 % 4 = 2
+            if remaining_heads:
+                real_rows = remaining_heads * head_dim  # 256
+                for i in range(num_qk_groups):
+                    if (i % groups_per_qk) == groups_per_qk - 1:
+                        self.qk_bank[i, real_rows:].zero_()
             self.qk_bank[num_qk_groups:].zero_()
             self.vo_bank[:num_vo_real].uniform_(-bound, bound)
             self.vo_bank[num_vo_real:].zero_()
@@ -1287,7 +1298,14 @@ class GPT(nn.Module):
         ve_gates = [None, veg[0], veg[1], *self.gate_filler_nones, veg[2], veg[3], veg[4]]
         assert len(attn_gates) == self.num_layers
         assert len(ve_gates) == self.num_layers
-        qk_all = self.qk_bank[:self._num_qk_groups].view(self._num_attn_layers, -1, self.qk_bank.shape[-1])
+        # groups of 4 heads: extract real rows, discarding padding within groups
+        gpq = self._groups_per_qk  # 2
+        hdim = self.attn.hdim
+        qk_grouped = self.qk_bank[:self._num_qk_groups].view(
+            self._num_attn_layers, 2, gpq, self._group_width, self.qk_bank.shape[-1])
+        # (10, 2, 2, 512, 768) -> flatten groups -> (10, 2, 1024, 768) -> slice real -> (10, 2, 768, 768)
+        qk_flat = qk_grouped.flatten(2, 3)[:, :, :hdim]
+        qk_all = qk_flat.flatten(1, 2)  # (10, 1536, 768)
         vo_flat = self.vo_bank[:self._num_attn_layers * 2].view(self._num_attn_layers, 2, *self.vo_bank.shape[1:]).flatten(1, 2)
         attn_weights = torch.cat([qk_all, vo_flat], dim=1).unbind(0)
         mlp_all = self.mlp_bank.flatten(0, 1).unbind(0)  # 24 tensors of [mlp_hdim, dim]
@@ -1861,8 +1879,8 @@ class TrainingManager():
 logfile = None
 if master_process:
     run_id = args.run_id
-    os.makedirs("logs_og", exist_ok=True)
-    logfile = f"logs_og/{run_id}.txt"
+    os.makedirs("logs5", exist_ok=True)
+    logfile = f"logs5/{run_id}.txt"
     print(logfile)
 def print0(s, console=False):
     if master_process:
@@ -1989,8 +2007,8 @@ for step in range(train_steps + 1):
     if last_step:
         if master_process and args.save_checkpoint:
             log = dict(step=step, code=code, model=model.state_dict(), optimizer=training_manager.get_state())
-            os.makedirs(f"logs_og/{run_id}", exist_ok=True)
-            torch.save(log, f"logs_og/{run_id}/state_step{step:06d}.pt")
+            os.makedirs(f"logs5/{run_id}", exist_ok=True)
+            torch.save(log, f"logs5/{run_id}/state_step{step:06d}.pt")
         # the last step only has the validation loop, so break to avoid training
         break
 

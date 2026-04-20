@@ -1182,8 +1182,16 @@ class GPT(nn.Module):
         mlp_hdim = 4 * model_dim
 
         # QK bank: per-head-pair Muon groups for Q, K weights
-        # Each pair of adjacent heads gets its own independent polar express orthogonalization
+        # Heads are permuted in the bank so Muon pairs DON'T align with attention pairs.
+        # Attention pairs: (0,1),(2,3),(4,5). Bank order: [0,2,1,4,3,5] → Muon pairs: (0,2),(1,4),(3,5).
         self._num_attn_layers = num_attn_layers
+        bank_head_order = [0, 2, 1, 4, 3, 5]
+        inv_perm = [0] * num_heads
+        for bank_pos, h in enumerate(bank_head_order):
+            inv_perm[h] = bank_pos
+        self.register_buffer('_qk_head_inv_perm', torch.tensor(inv_perm, dtype=torch.long), persistent=False)
+        self._head_dim = head_dim
+
         num_qk_groups = num_attn_layers * 2 * (num_heads // 2)  # 10 * 2 * 3 = 60
         self._num_qk_groups = num_qk_groups
         num_qk_padded = next_multiple_of_n(num_qk_groups, n=world_size)  # 64
@@ -1288,6 +1296,13 @@ class GPT(nn.Module):
         assert len(attn_gates) == self.num_layers
         assert len(ve_gates) == self.num_layers
         qk_all = self.qk_bank[:self._num_qk_groups].view(self._num_attn_layers, -1, self.qk_bank.shape[-1])
+        # Un-permute heads from bank order [0,2,1,4,3,5] back to [0,1,2,3,4,5]
+        hdim = self.attn.hdim
+        hd = self._head_dim
+        nh = hdim // hd
+        q = qk_all[:, :hdim].view(self._num_attn_layers, nh, hd, -1)[:, self._qk_head_inv_perm].reshape(self._num_attn_layers, hdim, -1)
+        k = qk_all[:, hdim:].view(self._num_attn_layers, nh, hd, -1)[:, self._qk_head_inv_perm].reshape(self._num_attn_layers, hdim, -1)
+        qk_all = torch.cat([q, k], dim=1)
         vo_flat = self.vo_bank[:self._num_attn_layers * 2].view(self._num_attn_layers, 2, *self.vo_bank.shape[1:]).flatten(1, 2)
         attn_weights = torch.cat([qk_all, vo_flat], dim=1).unbind(0)
         mlp_all = self.mlp_bank.flatten(0, 1).unbind(0)  # 24 tensors of [mlp_hdim, dim]
@@ -1861,8 +1876,8 @@ class TrainingManager():
 logfile = None
 if master_process:
     run_id = args.run_id
-    os.makedirs("logs_og", exist_ok=True)
-    logfile = f"logs_og/{run_id}.txt"
+    os.makedirs("logs6", exist_ok=True)
+    logfile = f"logs6/{run_id}.txt"
     print(logfile)
 def print0(s, console=False):
     if master_process:
@@ -1989,8 +2004,8 @@ for step in range(train_steps + 1):
     if last_step:
         if master_process and args.save_checkpoint:
             log = dict(step=step, code=code, model=model.state_dict(), optimizer=training_manager.get_state())
-            os.makedirs(f"logs_og/{run_id}", exist_ok=True)
-            torch.save(log, f"logs_og/{run_id}/state_step{step:06d}.pt")
+            os.makedirs(f"logs6/{run_id}", exist_ok=True)
+            torch.save(log, f"logs6/{run_id}/state_step{step:06d}.pt")
         # the last step only has the validation loop, so break to avoid training
         break
 
